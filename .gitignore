@@ -30,3 +30,9 @@ go.work.sum
 # Editor/IDE
 # .idea/
 # .vscode/
+/out
+/report
+*.exe
+node_modules
+.DS_Store
+c20
