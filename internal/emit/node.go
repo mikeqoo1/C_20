@@ -1,0 +1,452 @@
+package emit
+
+import (
+	"bytes"
+	"fmt"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+
+	"c20/internal/ast"
+)
+
+// EmitNode：把每個 Program 轉成一支 .js，並在 outDir 寫入 cobol_compat.js
+func EmitNode(progs []ast.Program, outDir string) error {
+	if err := writeRuntimeNode(outDir); err != nil {
+		return err
+	}
+	for _, p := range progs {
+		name := strings.TrimSpace(p.ID)
+		if name == "" {
+			// 若無 PROGRAM-ID，用來源檔名（去掉副檔名）
+			base := filepath.Base(p.Source)
+			if i := strings.LastIndexByte(base, '.'); i > 0 {
+				base = base[:i]
+			}
+			name = base
+		}
+		js, err := emitProgramNode(&p)
+		if err != nil {
+			return err
+		}
+		outPath := filepath.Join(outDir, name+".js")
+		if err := os.WriteFile(outPath, []byte(js), 0o644); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// ───────────────────────── helpers ─────────────────────────
+
+// 將 COBOL 名稱正規化為 JS 變數名：大寫、非 [A-Z0-9_] 轉為 '_'、壓縮連續 '_'、去頭尾 '_'；若數字開頭加前綴。
+func jsIdent(raw string) string {
+	s := strings.ToUpper(strings.TrimSpace(raw))
+	s = strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'A' && r <= 'Z':
+			return r
+		case r >= '0' && r <= '9':
+			return r
+		case r == '_':
+			return r
+		default:
+			return '_'
+		}
+	}, s)
+	for strings.Contains(s, "__") {
+		s = strings.ReplaceAll(s, "__", "_")
+	}
+	s = strings.Trim(s, "_")
+	if s == "" {
+		s = "FIELD"
+	}
+	if s[0] >= '0' && s[0] <= '9' {
+		s = "V_" + s
+	}
+	return s
+}
+
+type nameGen struct{ used map[string]int }
+
+func newNameGen() *nameGen { return &nameGen{used: map[string]int{}} }
+
+func (g *nameGen) uniq(raw string) string {
+	base := jsIdent(raw)
+	if n, ok := g.used[base]; ok {
+		n++
+		g.used[base] = n
+		return fmt.Sprintf("%s_%d", base, n)
+	}
+	g.used[base] = 1
+	return base
+}
+
+// 把像 "001" 轉成 "1"（避免 JS/TS 視為八進位常值）
+func jsDec(raw string) string {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return "0"
+	}
+	sign := ""
+	if s[0] == '-' {
+		sign = "-"
+		s = s[1:]
+	}
+	s = strings.TrimLeft(s, "0")
+	if s == "" {
+		s = "0"
+	}
+	return sign + s
+}
+
+func q(s string) string { // 產 JS 字串常值
+	var b bytes.Buffer
+	fmt.Fprintf(&b, "%q", s) // Go %q 會處理跳脫
+	return b.String()
+}
+
+func isSpacesLit(e ast.Expr) bool {
+	ls, ok := e.(ast.LitString)
+	return ok && strings.EqualFold(strings.TrimSpace(ls.Val), "SPACES")
+}
+
+// ───────────────────────── emit env ─────────────────────────
+
+type env struct {
+	buf     bytes.Buffer
+	indent  int
+	nameMap map[string]string // 「正規化名」→「此 Program 內第一個對應的 JS 名」
+	gen     *nameGen
+}
+
+func (e *env) line(s string, a ...any) {
+	for i := 0; i < e.indent; i++ {
+		e.buf.WriteString("  ")
+	}
+	if len(a) == 0 {
+		e.buf.WriteString(s)
+	} else {
+		fmt.Fprintf(&e.buf, s, a...)
+	}
+	e.buf.WriteByte('\n')
+}
+
+func (e *env) ident(name string) string {
+	n := jsIdent(name)
+	if v, ok := e.nameMap[n]; ok {
+		return v
+	}
+	return n // 若未記錄，直接用正規化名
+}
+
+// ───────────────────────── auto-declare 掃描 ─────────────────────────
+
+// 收集語句中用到的識別字（只關心「基底欄位名」）
+// 目的：找出 DATA DIVISION 沒宣告、但語句有用到的變數，例如 CMD-LINE。
+func collectUsedIdents(stmts []ast.Stmt, out map[string]bool) {
+	var walkExpr func(ast.Expr)
+	var walkBool func(ast.Bool)
+	var walkStmt func(ast.Stmt)
+
+	walkExpr = func(ex ast.Expr) {
+		switch v := ex.(type) {
+		case ast.Ident:
+			out[jsIdent(v.Name)] = true
+		case ast.RefMod:
+			// ref-mod 的 base 也要標記（BASE(start:length)）
+			out[jsIdent(v.Base)] = true
+			walkExpr(v.Start)
+			walkExpr(v.Len)
+		case ast.LitString, ast.LitNumber:
+			// no-op
+		default:
+			// no-op
+		}
+	}
+
+	walkBool = func(b ast.Bool) {
+		switch v := b.(type) {
+		case ast.Cmp:
+			walkExpr(v.Left)
+			walkExpr(v.Right)
+		case ast.BoolAnd:
+			walkBool(v.A)
+			walkBool(v.B)
+		case ast.BoolOr:
+			walkBool(v.A)
+			walkBool(v.B)
+		default:
+			// no-op
+		}
+	}
+
+	walkStmt = func(s ast.Stmt) {
+		switch v := s.(type) {
+		case ast.StDisplay:
+			for _, a := range v.Args { walkExpr(a) }
+		case ast.StMove:
+			walkExpr(v.Src)
+			walkExpr(v.Dst)
+		case ast.StIf:
+			walkBool(v.Cond)
+			for _, t := range v.Then { walkStmt(t) }
+			for _, t := range v.Else { walkStmt(t) }
+		case ast.StPerformUntil:
+			walkBool(v.Cond)
+			for _, t := range v.Body { walkStmt(t) }
+		case ast.StPerformVarying:
+			// 變動變數本身也要算一個識別字
+			out[jsIdent(v.VarName)] = true
+			walkExpr(v.From); walkExpr(v.By)
+			walkBool(v.Cond)
+			for _, t := range v.Body { walkStmt(t) }
+		case ast.StAccept:
+			// 典型的缺漏：ACCEPT CMD-LINE FROM COMMAND-LINE
+			walkExpr(v.Dst)
+		case ast.StSubFrom:
+			// SUBTRACT <amount> FROM <dst> 會用到 dst 這個識別字
+			out[jsIdent(v.Dst)] = true
+			walkExpr(v.Amount)
+		case ast.StStopRun:
+			// no-op
+		default:
+			// no-op（未支援語句忽略）
+		}
+	}
+
+	for _, s := range stmts { walkStmt(s) }
+}
+
+// ───────────────────────── emit core ─────────────────────────
+
+func emitProgramNode(p *ast.Program) (string, error) {
+	e := &env{
+		nameMap: map[string]string{},
+		gen:     newNameGen(),
+	}
+
+	// header
+	e.line("// Auto-generated by C_20 (Go->Node)")
+	if p.Source != "" {
+		e.line("// Source: %s", p.Source)
+	}
+	e.line("\"use strict\";")
+	e.line("const COBOL = require('./cobol_compat');")
+	e.line("")
+	e.line("// DATA DIVISION (flattened)")
+
+	// 1) 先輸出 DATA DIVISION 宣告；同名用 uniq（FILLER → FILLER, FILLER_2, ...）
+	declared := map[string]bool{} // 正規化名是否已由 DATA 宣告
+	for _, d := range p.Data {
+		jsName := e.gen.uniq(d.Name)
+
+		base := jsIdent(d.Name)
+		if _, ok := e.nameMap[base]; !ok {
+			e.nameMap[base] = jsName
+		}
+		declared[base] = true
+
+		switch d.Pic.Kind {
+		case ast.PicAlpha:
+			e.line("const %s = COBOL.alpha(%d); // PIC X(%d)", jsName, d.Pic.Len, d.Pic.Len)
+		case ast.PicNumeric:
+			e.line("const %s = COBOL.num({digits:%d, scale:%d, signed:%v}); // PIC 9(%d)", jsName, d.Pic.Digits, d.Pic.Scale, d.Pic.Signed, d.Pic.Digits)
+		default:
+			e.line("const %s = COBOL.alpha(%d); // PIC ?", jsName, 1)
+		}
+	}
+	e.line("")
+
+	// 2) 自動宣告：掃描語句使用到，但不在 DATA 的識別字（預設 Alpha(80)）
+	//    用途：解決 ACCEPT CMD-LINE FROM COMMAND-LINE → CMD_LINE 未宣告之錯誤。
+	used := map[string]bool{}
+	collectUsedIdents(p.Stmts, used)
+
+	// 剔除已宣告者，只保留真正缺漏的
+	var missing []string
+	for base := range used {
+		if !declared[base] {
+			missing = append(missing, base)
+		}
+	}
+	sort.Strings(missing)
+
+	if len(missing) > 0 {
+		for _, base := range missing {
+			jsName := e.gen.uniq(base)
+			if _, ok := e.nameMap[base]; !ok {
+				e.nameMap[base] = jsName
+			}
+			// 預設先宣告成 Alpha(80)。若未來需要可依使用情境（SUBTRACT 的 dst 等）判斷型別。
+			e.line("const %s = COBOL.alpha(80); // [auto-declared]", jsName)
+		}
+		e.line("")
+	}
+
+	// 3) main()
+	e.line("function main(){")
+	e.indent++
+
+	for _, s := range p.Stmts {
+		emitStmt(e, s)
+	}
+
+	e.indent--
+	e.line("}")
+	e.line("")
+	e.line("if (require.main === module) { main(); }")
+	return e.buf.String(), nil
+}
+
+// 語句輸出
+func emitStmt(e *env, s ast.Stmt) {
+	switch v := s.(type) {
+
+	case ast.StDisplay:
+		var parts []string
+		for _, a := range v.Args {
+			parts = append(parts, "COBOL.str("+emitExprJS(e, a)+")")
+		}
+		e.line("console.log(%s);", strings.Join(parts, ", "))
+
+	case ast.StMove:
+		dstJS, dstBase := emitLHSAndBase(e, v.Dst)
+		var src string
+		if isSpacesLit(v.Src) {
+			src = "COBOL.spaces(" + dstBase + ")"
+		} else {
+			src = emitExprJS(e, v.Src)
+		}
+		e.line("COBOL.move(%s, %s);", dstJS, src)
+
+	case ast.StIf:
+		cond := emitBool(e, v.Cond)
+		e.line("if (%s) {", cond)
+		e.indent++
+		for _, t := range v.Then { emitStmt(e, t) }
+		e.indent--
+		if len(v.Else) > 0 {
+			e.line("} else {")
+			e.indent++
+			for _, t := range v.Else { emitStmt(e, t) }
+			e.indent--
+		}
+		e.line("}")
+
+	case ast.StStopRun:
+		e.line("process.exit(0);")
+
+	case ast.StPerformUntil:
+		cond := emitBool(e, v.Cond)
+		e.line("while (!(%s)) {", cond)
+		e.indent++
+		for _, t := range v.Body { emitStmt(e, t) }
+		e.indent--
+		e.line("}")
+
+	case ast.StPerformVarying:
+		varName := e.ident(v.VarName)
+		from := emitExprJS(e, v.From)
+		by := emitExprJS(e, v.By)
+		cond := emitBool(e, v.Cond)
+		e.line("%s.value = %s|0;", varName, from)
+		e.line("for (;;) {")
+		e.indent++
+		e.line("if (%s) break;", cond)
+		for _, t := range v.Body { emitStmt(e, t) }
+		e.line("%s.value = (%s.value|0) + (%s|0);", varName, varName, by)
+		e.indent--
+		e.line("}")
+
+	case ast.StAccept:
+		dstJS, _ := emitLHSAndBase(e, v.Dst)
+		switch f := v.From.(type) {
+		case ast.AcceptTime:
+			e.line("COBOL.accept(%s, {from:\"TIME\"});", dstJS)
+		case ast.AcceptCenturyDate:
+			e.line("COBOL.accept(%s, {from:\"CENTURY-DATE\"});", dstJS)
+		case ast.AcceptEnv:
+			e.line("COBOL.accept(%s, {from:\"ENV\", name:%s});", dstJS, q(f.Name))
+		case ast.AcceptCommandLine:
+			e.line("COBOL.accept(%s, {from:\"COMMAND-LINE\"});", dstJS)
+		default:
+			e.line("COBOL.accept(%s, {from:\"UNKNOWN\"});", dstJS)
+		}
+
+	case ast.StSubFrom:
+		e.line("COBOL.sub(%s, %s);", e.ident(v.Dst), emitExprJS(e, v.Amount))
+
+	default:
+		e.line("// [TODO not-emitted]: %#v", v)
+	}
+}
+
+// 表達式輸出
+func emitExprJS(e *env, expr ast.Expr) string {
+	switch v := expr.(type) {
+	case ast.Ident:
+		return e.ident(v.Name)
+	case ast.LitString:
+		return q(v.Val)
+	case ast.LitNumber:
+		return jsDec(v.Raw)
+	case ast.RefMod:
+		base := e.ident(v.Base)
+		start := emitExprJS(e, v.Start)
+		length := emitExprJS(e, v.Len)
+		return fmt.Sprintf("COBOL.slice(%s, %s, %s)", base, start, length)
+	default:
+		return "undefined"
+	}
+}
+
+// 取得左值 JS 表達式 + 其底層 base 名（MOVE/ACCEPT 用）
+func emitLHSAndBase(e *env, dst ast.Expr) (dstJS string, baseJS string) {
+	switch v := dst.(type) {
+	case ast.Ident:
+		id := e.ident(v.Name)
+		return id, id
+	case ast.RefMod:
+		base := e.ident(v.Base)
+		start := emitExprJS(e, v.Start)
+		length := emitExprJS(e, v.Len)
+		return fmt.Sprintf("COBOL.slice(%s, %s, %s)", base, start, length), base
+	default:
+		return emitExprJS(e, dst), emitExprJS(e, dst)
+	}
+}
+
+// 轉布林條件
+func emitBool(e *env, b ast.Bool) string {
+	switch v := b.(type) {
+	case ast.Cmp:
+		left := emitExprJS(e, v.Left)
+		right := ""
+		if isSpacesLit(v.Right) {
+			right = "COBOL.spaces(" + left + ")"
+		} else {
+			right = emitExprJS(e, v.Right)
+		}
+		return fmt.Sprintf("COBOL.cmp(%s, %q, %s)", left, string(v.Op), right)
+	case ast.BoolAnd:
+		a := emitBool(e, v.A)
+		bb := emitBool(e, v.B)
+		return "(" + a + " && " + bb + ")"
+	case ast.BoolOr:
+		a := emitBool(e, v.A)
+		bb := emitBool(e, v.B)
+		return "(" + a + " || " + bb + ")"
+	default:
+		return "false"
+	}
+}
+
+// 排序用小工具（除錯/測試）
+func sortedKeys(m map[string]string) []string {
+	ks := make([]string, 0, len(m))
+	for k := range m { ks = append(ks, k) }
+	sort.Strings(ks)
+	return ks
+}

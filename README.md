@@ -21,8 +21,10 @@ go build ./cmd/c20
 ```
 
 ```bash
-./c20 --in examples/hello/*.cbl --target node --out out/node --report report
+./c20 --in examples/hello/*.cbl --out out/node --report report
 node out/node/HELLO.js
+
+./c20 --in examples/hello/*.cbl --out out/node --report report
 ```
 
 ## 專案結構（重點檔案都有很密的註解）

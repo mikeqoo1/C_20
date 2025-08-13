@@ -1,0 +1,18 @@
+       IDENTIFICATION DIVISION.
+       PROGRAM-ID. HELLO.
+       DATA DIVISION.
+       WORKING-STORAGE SECTION.
+       01 WS-TXT PIC X(10) VALUE "HI".
+       01 WS-CTR PIC 9(3).
+       PROCEDURE DIVISION.
+           DISPLAY WS-TXT.
+           MOVE 1 TO WS-CTR.
+           PERFORM VARYING WS-CTR FROM 1 BY 1 UNTIL WS-CTR > 3
+             DISPLAY "LOOP" WS-CTR
+           END-PERFORM.
+           IF WS-CTR >= 3
+             DISPLAY "DONE"
+           ELSE
+             DISPLAY "NOT DONE"
+           END-IF.
+           STOP RUN.
