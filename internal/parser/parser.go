@@ -80,13 +80,13 @@ var (
 )
 
 // parsePicSpec 把 PIC 描述轉成 ast.PicSpec。
-// 支援：X(n) / S?9(d)[V9(s)] [COMP-3]
+// 支援：X(n) / X(n) COMP-X / S?9(d)[V9(s)] [COMP-3]
 // 回傳 (spec, ok)。不支援的 PIC 會回 false（呼叫端通常略過該欄位）。
 func parsePicSpec(picText string) (ast.PicSpec, bool) {
 	txt := strings.TrimSpace(strings.ToUpper(picText))
 
-	// 字母型：X(n)
-	if m := regexp.MustCompile(`^[X]\((\d+)\)$`).FindStringSubmatch(txt); m != nil {
+	// 字母型：X(n) 或 X(n) COMP-X
+	if m := regexp.MustCompile(`^[X]\((\d+)\)(?:\s+COMP-X)?$`).FindStringSubmatch(txt); m != nil {
 		n, _ := strconv.Atoi(m[1])
 		return ast.PicSpec{Kind: ast.PicAlpha, Len: n}, true
 	}
@@ -103,10 +103,10 @@ func parsePicSpec(picText string) (ast.PicSpec, bool) {
 		}
 		return ast.PicSpec{
 			Kind:   ast.PicNumeric,
-			Digits: d + scale,                  // 總位數（含小數位）
-			Scale:  scale,                      // 小數位數
+			Digits: d + scale,                    // 總位數（含小數位）
+			Scale:  scale,                        // 小數位數
 			Signed: strings.HasPrefix(txt, "S9"), // 是否帶號
-			Comp3:  reHasComp3.MatchString(txt), // 是否出現 COMP-3 標記
+			Comp3:  reHasComp3.MatchString(txt),  // 是否出現 COMP-3 標記
 		}, true
 	}
 
@@ -167,7 +167,7 @@ func parseDataDivision(lines []string) []ast.DataItem {
 // - stmts：線性語句列（包含 if-block 的 then/else 內嵌）
 // - lineIndex：語句索引 → 原始行號（便於報告/錯誤定位）
 //
-// 支援語句：IF/ELSE/END-IF（含單行 THEN ... END-IF）、MOVE、DISPLAY、ACCEPT、SUBTRACT、STOP RUN。
+// 支援語句：IF/ELSE/END-IF（含單行 THEN ... END-IF）、MOVE、DISPLAY、ACCEPT、SUBTRACT、UNSTRING、STOP RUN。
 // 暫不支援：OPEN/CLOSE/READ/PERFORM/CALL/GO TO…（會被忽略）。
 func parseProcedureDivision(lines []string) ([]ast.Stmt, map[int]int) {
 	var stmts []ast.Stmt
@@ -190,12 +190,12 @@ func parseProcedureDivision(lines []string) ([]ast.Stmt, map[int]int) {
 
 	// 以堆疊管理巢狀 IF 區塊
 	type ifFrame struct {
-		cond    ast.Bool   // IF 條件
+		cond    ast.Bool    // IF 條件
 		parent  *[]ast.Stmt // 上一層容器（頂層或外層 IF 的 then/else）
-		thenB   []ast.Stmt // THEN 區塊
-		elseB   []ast.Stmt // ELSE 區塊
-		inElse  bool       // 目前是否在 else 區
-		srcLine int        // IF 起始行號（給 lineIndex）
+		thenB   []ast.Stmt  // THEN 區塊
+		elseB   []ast.Stmt  // ELSE 區塊
+		inElse  bool        // 目前是否在 else 區
+		srcLine int         // IF 起始行號（給 lineIndex）
 	}
 	var (
 		cur   *[]ast.Stmt = &stmts // 目前寫入目標（預設指向頂層 stmts）
@@ -233,6 +233,28 @@ func parseProcedureDivision(lines []string) ([]ast.Stmt, map[int]int) {
 
 		// 純標籤/段落名稱/SECTION 標頭（如 "MAIN-RTN SECTION.", "0000-EXIT."）直接略過
 		if looksLikeLabel(u) {
+			continue
+		}
+
+		// UNSTRING（可能橫跨多行直到 END-UNSTRING.）
+		if strings.HasPrefix(u, "UNSTRING ") {
+			block := s
+			j := idx + 1
+			for ; j < len(lines); j++ {
+				part := cleanStmtLine(lines[j])
+				if part == "" {
+					continue
+				}
+				block += " " + part
+				if strings.Contains(strings.ToUpper(part), "END-UNSTRING") {
+					break
+				}
+			}
+			idx = j // 跳過用過的行
+
+			if st := parseUnstring(block); st != nil {
+				appendStmt(cur, st, srcLine)
+			}
 			continue
 		}
 
@@ -339,12 +361,59 @@ func parseProcedureDivision(lines []string) ([]ast.Stmt, map[int]int) {
 	return stmts, lineIndex
 }
 
+// UNSTRING <src> DELIMITED BY ALL " " INTO a, b, c [, d] [TALLYING ct] END-UNSTRING.
+func parseUnstring(block string) ast.Stmt {
+	// 先把尾端的 END-UNSTRING. 去掉，只保留主體
+	U := strings.ToUpper(block)
+	if !strings.Contains(U, "END-UNSTRING") {
+		return nil
+	}
+	// 保留原大小寫以利 parseExpr，但用索引尋找切割點
+	iDelim := strings.Index(U, " DELIMITED BY ALL ")
+	iInto := strings.Index(U, " INTO ")
+	if iDelim < 0 || iInto < 0 || iInto <= iDelim {
+		return nil
+	}
+	srcText := strings.TrimSpace(block[len("UNSTRING "):iDelim])
+	src := parseExpr(srcText)
+
+	rest := block[iInto+len(" INTO "):]
+	// 刪掉 END-UNSTRING 後面的東西
+	if j := strings.Index(strings.ToUpper(rest), "END-UNSTRING"); j >= 0 {
+		rest = rest[:j]
+	}
+	// 解析 TALLYING
+	tally := ""
+	UR := strings.ToUpper(rest)
+	if k := strings.Index(UR, " TALLYING "); k >= 0 {
+		tallyPart := strings.TrimSpace(rest[k+len(" TALLYING "):])
+		rest = strings.TrimSpace(rest[:k])
+		// 取第一個 token 當 tally 名
+		tt := tokenize(tallyPart)
+		if len(tt) > 0 {
+			tally = strings.ToUpper(strings.Trim(tt[0], ",; "))
+		}
+	}
+	// 目的地清單（以逗號分隔）
+	var dsts []ast.Expr
+	for _, tok := range strings.Split(rest, ",") {
+		tok = strings.TrimSpace(strings.Trim(tok, "; "))
+		if tok == "" {
+			continue
+		}
+		dsts = append(dsts, parseExpr(tok))
+	}
+	if len(dsts) == 0 {
+		return nil
+	}
+	return ast.StUnstring{Src: src, Dsts: dsts, Tally: tally}
+}
+
 // parseAccept 支援的語法（子集）：
 //   ACCEPT <dst> [FROM TIME|CENTURY-DATE|ENVIRONMENT "<env>"|COMMAND-LINE].
 //
 // - <dst> 允許一般識別字，也允許 RefMod（視下方 parseExpr 支援）。
 // - FROM 省略時，From 欄位為 nil（emitter 端會處理 UNKNOWN 或預設行為）。
-// - 注意：ENVIRONMENT "<env>" 這裡的 token 取得方式是簡化版，對於怪異空白/引號組合不保證覆蓋全部情況。
 func parseAccept(line string) ast.Stmt {
 	u := strings.TrimSuffix(line, ".")
 	tok := tokenize(u)
@@ -356,26 +425,24 @@ func parseAccept(line string) ast.Stmt {
 	var from ast.AcceptFrom = nil
 	// 尋找 FROM 之後的來源描述
 	for i := 2; i < len(tok); i++ {
-		if tok[i] == "FROM" {
+		if strings.EqualFold(tok[i], "FROM") {
 			rest := tok[i+1:]
 			if len(rest) > 0 {
-				switch rest[0] {
+				switch strings.ToUpper(rest[0]) {
 				case "TIME":
 					from = ast.AcceptTime{}
 				case "CENTURY-DATE":
 					from = ast.AcceptCenturyDate{}
 				case "ENVIRONMENT":
 					// ENVIRONMENT "<name>"
-					// （簡化：此處假設 "<name>" 被 tokenizer 當成一個 token）
-					if i+2 < len(rest) {
-						from = ast.AcceptEnv{Name: trimQuotes(rest[i+2])}
+					if len(rest) >= 2 {
+						from = ast.AcceptEnv{Name: trimQuotes(rest[1])}
 					} else {
 						from = ast.AcceptEnv{Name: ""}
 					}
 				case "COMMAND-LINE":
 					from = ast.AcceptCommandLine{}
 				default:
-					// 未知來源：讓 emitter 照常輸出 accept（可能標 UNKNOWN）
 					from = nil
 				}
 			}
@@ -472,8 +539,8 @@ func parseDisplay(line string) ast.Stmt {
 
 // ───────────────────────────────────────────────────────────────────────────────
 // 條件解析：比較運算 + AND/OR（AND 優先於 OR，左結合）
-//   支援：A (=|<>|NOT =|<|<=|>|>=) B  [AND/OR ...]
-//   較進階（括號、複合運算）目前未做；常見報表條件通常足夠。
+//   支援：A (=|<>|NOT =|<|<=|>|>=) B、A [NOT] NUMERIC  [AND/OR ...]
+//   括號會被接受（僅用於分組，這裡直接過濾掉不做優先權影響）。
 //   回傳：(布林 AST, THEN 後的尾字串 tail)
 // ───────────────────────────────────────────────────────────────────────────────
 
@@ -490,19 +557,40 @@ func parseCond(rest string) (ast.Bool, string) {
 		tail = ""
 	}
 
-	tok := tokenize(condText)
+	// token 化後，過濾括號
+	rawTok := tokenize(condText)
+	var tok []string
+	for _, t := range rawTok {
+		if t == "(" || t == ")" {
+			continue
+		}
+		tok = append(tok, t)
+	}
 	if len(tok) == 0 {
 		return nil, tail
 	}
 
-	// 解析單一比較 A <op> B；支援 NOT =（視同 <>）
+	// 解析單一比較或 NUMERIC 測試
 	parseCmp := func(i int) (ast.Bool, int) {
-		if i+2 >= len(tok) {
+		if i >= len(tok) {
 			return nil, i
 		}
 		left := parseExpr(tok[i])
+		if i+1 >= len(tok) {
+			return nil, i
+		}
 		opTok := strings.ToUpper(tok[i+1])
 		j := i + 2
+
+		// <expr> [NOT] NUMERIC
+		if opTok == "NUMERIC" {
+			return ast.IsNumeric{Expr: left, Neg: false}, j
+		}
+		if opTok == "NOT" && j < len(tok) && strings.ToUpper(tok[j]) == "NUMERIC" {
+			return ast.IsNumeric{Expr: left, Neg: true}, j + 1
+		}
+
+		// 一般比較
 		var op ast.CmpOp
 		switch opTok {
 		case "=":
@@ -528,10 +616,10 @@ func parseCond(rest string) (ast.Bool, string) {
 		return ast.Cmp{Left: left, Op: op, Right: right}, j + 1
 	}
 
-	// 以 AND 優先於 OR 的方式做兩段式 reduce（左結合）
+	// AND 優先於 OR（左結合）
 	type node struct {
 		val ast.Bool
-		op  string // "AND" or "OR"（與下一個節點相接的運算）
+		op  string // "AND" or "OR"
 	}
 	var nodes []node
 	for i := 0; i < len(tok); {
@@ -754,10 +842,14 @@ var rePageHdr = regexp.MustCompile(`\bPage:\s*\d+\b`)
 // reSeq：行首 5~6 碼位址/行號 + 空白，作為 .REP 殘留的保險清理。
 var reSeq = regexp.MustCompile(`^\s*[0-9A-F]{5,6}\s+`)
 
+// reDatedComment：例如 "941219* ..." 這種「日期+星號」變更註記行，整行當註解丟棄。
+var reDatedComment = regexp.MustCompile(`^\s*[0-9A-F]{5,6}\*`)
+
 // normalizeLines：再做一次保守清理（在 loader 清的基礎上）。
 // - 去掉空行 / form feed
 // - 再次剔除帶 ACUCOBOL 的 Page: 標頭
-// - stripSeqNo：行首 5~6 碼位址碼
+// - stripSeqNo：行首 5~6 碼位址碼；也移除前導 '|'（某些歷史檔案會用 '|' 當欄位輔助線）
+// - 把像 "941219* ..." 這種日期+星號的變更標記行直接捨棄
 func normalizeLines(text string) []string {
 	raw := strings.Split(text, "\n")
 	var out []string
@@ -770,14 +862,26 @@ func normalizeLines(text string) []string {
 			continue
 		}
 		ln = stripSeqNo(ln)
+		if ln == "" {
+			continue
+		}
 		out = append(out, ln)
 	}
 	return out
 }
 
-// stripSeqNo：移除行首位址欄（殘留的 .REP 行號/位址碼）
+// stripSeqNo：移除行首位址欄與前導 '|'；並處理日期星號註記行。
 func stripSeqNo(s string) string {
-	return reSeq.ReplaceAllString(s, "")
+	// 先把像 "941219* ..." 的變更標記整行視為註解
+	if reDatedComment.MatchString(s) {
+		return ""
+	}
+	// 去掉 "| " 版面輔助線
+	ss := strings.TrimLeft(s, " \t")
+	if strings.HasPrefix(ss, "|") {
+		ss = strings.TrimSpace(ss[1:])
+	}
+	return reSeq.ReplaceAllString(ss, "")
 }
 
 // cleanStmtLine：清理一個 Procedure 行為「可解析」的語句：
@@ -787,7 +891,10 @@ func stripSeqNo(s string) string {
 // - 把多重空白壓成單空白（方便 tokenizer）
 func cleanStmtLine(s string) string {
 	s = strings.TrimSpace(s)
-	if strings.HasPrefix(strings.TrimSpace(s), "*") {
+	if s == "" {
+		return ""
+	}
+	if strings.HasPrefix(s, "*") {
 		return ""
 	}
 	if i := strings.Index(s, "      *"); i >= 0 {
@@ -813,7 +920,7 @@ func looksLikeLabel(u string) bool {
 	}) != -1 {
 		return false
 	}
-	keyverbs := []string{"IF ", "MOVE ", "DISPLAY ", "ACCEPT ", "SUBTRACT ", "STOP RUN", "ELSE", "END-IF"}
+	keyverbs := []string{"IF ", "MOVE ", "DISPLAY ", "ACCEPT ", "SUBTRACT ", "STOP RUN", "ELSE", "END-IF", "UNSTRING "}
 	for _, kv := range keyverbs {
 		if strings.HasPrefix(u, kv) {
 			return false

@@ -16,6 +16,10 @@ import (
 // - 這裡不負責執行，只負責把 AST 轉成具體 JS 字串並寫檔。
 // - 檔名預設用 PROGRAM-ID，若無，改用來源檔名去副檔名。
 func EmitNode(progs []ast.Program, outDir string) error {
+	// 確保輸出目錄存在
+	if err := os.MkdirAll(outDir, 0o755); err != nil {
+		return err
+	}
 	// 先確保 runtime 存在（避免 node 執行 require('./cobol_compat') 時找不到）
 	if err := writeRuntimeNode(outDir); err != nil {
 		return err
@@ -395,8 +399,8 @@ func emitStmt(e *env, s ast.Stmt) {
 		e.line("}")
 
 	case ast.StStopRun:
-		// STOP RUN → 直接結束行程
-		e.line("process.exit(0);")
+		// STOP RUN：線性展開下若直接 exit 會讓後續語句跑不到，先忽略。
+		e.line("// STOP RUN (ignored)")
 
 	case ast.StPerformUntil:
 		// while (!(cond)) { body }
@@ -501,15 +505,30 @@ func emitLHSAndBase(e *env, dst ast.Expr) (dstJS string, baseJS string) {
 
 // emitBool：把布林條件（比較/AND/OR）轉成 JS。
 // 比較由 runtime.COBOL.cmp() 處理，確保字串/數值/對齊/填充等 COBOL 規則正確。
+// 另外支援左右任一邊為 SPACES 時，自動產出與另一邊同長度的空白。
 func emitBool(e *env, b ast.Bool) string {
 	switch v := b.(type) {
 	case ast.Cmp:
-		left := emitExprJS(e, v.Left)
-		right := ""
-		// IF X = SPACES → 右側以 COBOL.spaces(left) 生成相同長度的 all-spaces
-		if isSpacesLit(v.Right) {
-			right = "COBOL.spaces(" + left + ")"
-		} else {
+		// 左右對稱處理 SPACES
+		var left, right string
+		leftIsSpaces := isSpacesLit(v.Left)
+		rightIsSpaces := isSpacesLit(v.Right)
+
+		switch {
+		case leftIsSpaces && !rightIsSpaces:
+			r := emitExprJS(e, v.Right)
+			left = "COBOL.spaces(" + r + ")"
+			right = r
+		case !leftIsSpaces && rightIsSpaces:
+			l := emitExprJS(e, v.Left)
+			left = l
+			right = "COBOL.spaces(" + l + ")"
+		case leftIsSpaces && rightIsSpaces:
+			// 兩邊都是 SPACES：以空字串比較等價（長度皆為 0 → runtime 會依實作返回等價）
+			left = `""`
+			right = `""`
+		default:
+			left = emitExprJS(e, v.Left)
 			right = emitExprJS(e, v.Right)
 		}
 		return fmt.Sprintf("COBOL.cmp(%s, %q, %s)", left, string(v.Op), right)

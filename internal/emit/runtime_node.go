@@ -9,6 +9,9 @@ import (
 // 這個 runtime 是轉出來的 .js 程式在 Node.js 環境執行所需的最小支援層。
 // 注意：這裡僅負責寫檔，不做內容變更；內容定義在 nodeRuntime 常數字串。
 func writeRuntimeNode(outDir string) error {
+	if err := os.MkdirAll(outDir, 0o755); err != nil {
+		return err
+	}
 	path := filepath.Join(outDir, "cobol_compat.js")
 	return os.WriteFile(path, []byte(nodeRuntime), 0o644)
 }

@@ -131,6 +131,16 @@ func (BoolAnd) isBool() {}
 type BoolOr struct{ A, B Bool }
 func (BoolOr) isBool() {}
 
+// IsNumeric 對應條件「<expr> NUMERIC / NOT NUMERIC」的最小型 AST。
+//   - Expr：被測試的運算式（通常是欄位或字面值）
+//   - Neg ：true 代表 NOT NUMERIC
+//   emitter(Node) 端以 runtime 的 isNumericStr() 實作。
+type IsNumeric struct {
+	Expr Expr
+	Neg  bool // true = NOT NUMERIC
+}
+func (IsNumeric) isBool() {}
+
 // ─── STMTS（語句） ─────────────────────────────────────────────────────────────
 
 // Stmt 是所有語句節點的共同介面。
@@ -183,6 +193,17 @@ func (StPerformVarying) isStmt() {}
 // StStopRun 對應 STOP RUN。
 type StStopRun struct{}
 func (StStopRun) isStmt() {}
+
+// StUnstring 對應 UNSTRING 的最小子集：
+//   UNSTRING <Src> DELIMITED BY ALL " " INTO a, b, c [, d] [TALLYING ct] END-UNSTRING.
+//   - 我們目前只支援「以一個或多個空白切割」並把結果依序放到 Dsts；不足的補空字串，多的截掉。
+//   - Tally：若有指定，emitter 會寫入實際「被賦值的欄位數」。
+type StUnstring struct {
+	Src   Expr   // 通常是 Ident（例如 CMD-LINE）
+	Dsts  []Expr // 通常是 Ident；允許 RefMod 但目前 emitter 會當一般目的地處理
+	Tally string // 可為空字串（表示未指定）
+}
+func (StUnstring) isStmt() {}
 
 // StAccept 對應 ACCEPT 語句：ACCEPT <Dst> [FROM <source>]。
 //   - Dst  ：目的欄位（Ident 或 RefMod）
