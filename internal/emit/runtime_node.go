@@ -5,13 +5,20 @@ import (
 	"path/filepath"
 )
 
-// writeRuntimeNode：把 Node 端 runtime（cobol_compat.js）寫進 outDir
+// writeRuntimeNode：把 Node 端 runtime（cobol_compat.js）寫進 outDir。
+// 這個 runtime 是轉出來的 .js 程式在 Node.js 環境執行所需的最小支援層。
+// 注意：這裡僅負責寫檔，不做內容變更；內容定義在 nodeRuntime 常數字串。
 func writeRuntimeNode(outDir string) error {
 	path := filepath.Join(outDir, "cobol_compat.js")
 	return os.WriteFile(path, []byte(nodeRuntime), 0o644)
 }
 
-// 真正寫入的 JS 內容（盡量自註解，方便日後維護）
+// nodeRuntime：真正寫入的 JS 內容。
+// 設計理念：
+// 1) 用簡單 JS 物件來表示 COBOL 的欄位型別（alpha / numeric）。
+// 2) 提供 MOVE / ACCEPT / SUBTRACT / REFMOD(s) / 比較 等最低限度行為。
+// 3) 多處加入「防呆」：就算輸入異常也盡量不中斷，讓轉譯結果可運行與除錯。
+// 4) 規則採「可用為先」的簡化版（例如 numeric 以整數處理，不做 packed decimal）。
 const nodeRuntime = `
 // cobol_compat.js
 // 這是轉譯後 JS 程式在 Node.js 執行所需的最低限度 runtime。
@@ -23,12 +30,17 @@ const nodeRuntime = `
 //
 // AlphaField：字串欄位（固定長度）
 //   { kind:"alpha", size:N, buf:string }
+//   - size 表示固定長度
+//   - buf 為目前內容（左靠、右側補空白）
 //
 // AlphaSlice：針對 AlphaField 的視窗切片（1-based start）
 //   { kind:"alpha-slice", field:AlphaField, start:number, len:number }
+//   - 對應 COBOL 的 reference modification：BASE(start:length)
+//   - start 為 1-based（COBOL 習慣）；內部轉換時會改 0-based
 //
-// NumericField：數值欄位
+// NumericField：數值欄位（簡化為整數，scale 表示小數位數，用字串輸出時才呈現）
 //   { kind:"num", digits:number, scale:number, signed:boolean, value:number }
+//   - value 只存「整數」，例如 PIC 9(6)V9(2) 會以 value=整數 表示（印字串時才斷點）
 
 function alpha(n) {
   return { kind: "alpha", size: n|0, buf: " ".repeat(n|0) };
@@ -45,6 +57,9 @@ function num(spec) {
 }
 
 // ───────────────────── 小工具與型別守衛 ─────────────────────
+//
+// 這些 helper 用來判斷型別與做共用處理；
+// 目標是將 COBOL 動作（MOVE/IF/...）映射到 JS 時能保持語意一致。
 
 function isAlpha(x)       { return x && x.kind === "alpha"; }
 function isAlphaSlice(x)  { return x && x.kind === "alpha-slice"; }
@@ -66,12 +81,16 @@ function alphaGet(x) {
     // COBOL ref-mod：start 是 1-based；JS substr 用 0-based
     const i = (x.start|0) - 1;
     const j = i + (x.len|0);
+    // 注意：這裡假設 x.field 為合法 AlphaField；若外部傳錯型別，
+    // 我們仍會依據初始化時的防呆（slice() 中）讓 field 至少是 alpha(0)。
     return x.field.buf.slice(i, j);
   }
+  // 非 alpha 類型，回空字串避免 throw
   return "";
 }
 
 // 寫入 alpha/slice：左靠、超出截斷、長度不足補空白
+// 注意：這符合 COBOL 對定長字串欄位 MOVE 的常見行為（對齊/截斷/補空白）
 function alphaSet(dst, srcStr) {
   const s = (srcStr == null) ? "" : String(srcStr);
   const L = alphaLen(dst);
@@ -85,11 +104,15 @@ function alphaSet(dst, srcStr) {
   } else if (isAlphaSlice(dst)) {
     const i = (dst.start|0) - 1;
     const j = i + (dst.len|0);
+    // 將切片區間以 out 覆蓋回原本的 field.buf
     dst.field.buf = dst.field.buf.slice(0, i) + out + dst.field.buf.slice(j);
   }
 }
 
 // JS 顯示用：把欄位或常值轉成字串（DISPLAY/console.log 用）
+// - alpha/slice：回傳目前 buf/切片文字
+// - num：依 scale 輸出帶小數點的字串
+// - 其他型別：String() 一般化
 function str(x) {
   if (isAlpha(x) || isAlphaSlice(x)) {
     return alphaGet(x);
@@ -111,6 +134,7 @@ function str(x) {
 }
 
 // 產生與目標欄位等長的 spaces 字串（MOVE/IF 常會用到）
+// 例如 IF X = SPACES、MOVE SPACES TO X 等。
 function spaces(dstLike) {
   return " ".repeat(alphaLen(dstLike));
 }
@@ -118,7 +142,9 @@ function spaces(dstLike) {
 // ───────────────────── REFMOD（slice） ─────────────────────
 //
 // COBOL.slice(base, start, len)
-// 傳回一個視窗，之後 MOVE/STR/CMP 都可以直接拿這個切片使用。
+// - 回傳一個「切片視圖」，後續 MOVE/str/cmp 都可以直接將此視圖當成目標/來源。
+// - start/len 以 COBOL 習慣的 1-based 計算。
+// 防呆策略：若 base 不是 alpha，回傳長度 0 的 slice，避免 throw。
 //
 function slice(base, start, len) {
   if (!isAlpha(base)) {
@@ -135,6 +161,7 @@ function slice(base, start, len) {
 // MOVE 規則（簡化版）：
 // - 目標是 alpha/slice：把來源轉字串後，左靠、截斷/補空白。
 // - 目標是 numeric：把來源轉成整數（不處理編碼/符號欄位），寫入 .value。
+//   * 來源若是 alpha，會以 parseInt(trimmed) 嘗試轉換（失敗當 0）。
 //
 function move(dst, src) {
   // 目標是 alpha/slice
@@ -177,8 +204,11 @@ function move(dst, src) {
 // ───────────────────── 比較（=, <>, <, <=, >, >=） ─────────────────────
 //
 // cmp(a, op, b)：回傳布林值。
-// - 若 a/b 其中一個是 numeric → 以整數比較。
+// 規則：
+// - 若 a/b 其中一個是 numeric → 以整數比較（兩邊都嘗試轉整數）；
 // - 否則以字串比較（alpha/slice 用 alphaGet；其餘 toString）。
+// 注意：這裡是「實用簡化版」：無視 COLLATING SEQUENCE、刪除尾空白等更細規則。
+// 若有需要，可日後提升行為嚴謹度。
 //
 function cmp(a, op, b) {
   // 先把 a, b 正規成值與比較模式
@@ -214,11 +244,13 @@ function cmp(a, op, b) {
 // ───────────────────── ACCEPT ─────────────────────
 //
 // accept(dst, {from: ...})
+// 支援：
 // - TIME           → HHMMSS
 // - CENTURY-DATE   → YYYYMMDD
-// - ENV + name     → process.env[name] 或 空白
+// - ENV + name     → process.env[name] 或 空白（未定義）
 // - COMMAND-LINE   → 以空白串起 argv（去掉 node 與 script）
-// 其他值一律給空白（保持安全）
+// 其他值一律給空白（保持安全）。
+// 回寫：alpha/slice 以字串寫入；numeric 嘗試 parseInt（失敗為 0）。
 //
 function accept(dst, opt) {
   const from = opt && opt.from ? String(opt.from).toUpperCase() : "UNKNOWN";
@@ -259,7 +291,8 @@ function accept(dst, opt) {
 // ───────────────────── SUBTRACT ─────────────────────
 //
 // sub(dstNumeric, amount)：對應 COBOL 的「SUBTRACT amount FROM dst」
-// amount 可以是 number / NumericField / AlphaField（可 parse 時）
+// amount 可為 number / NumericField / AlphaField（可 parse 時）。
+// 注意：這裡把 numeric 視為整數；若未來要支援 packed decimal 或 BCD，需在這裡擴充。
 function sub(dst, amount) {
   if (!isNum(dst)) return;
 
