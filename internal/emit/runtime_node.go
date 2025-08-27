@@ -314,10 +314,86 @@ function sub(dst, amount) {
   dst.value = (dst.value|0) - (v|0);
 }
 
+// ───────────────────── 檔案 I/O（極簡版） ─────────────────────
+const fs = require("fs");
+
+function _mkFH(path, mode){
+  return { path:String(path||""), mode:String(mode||"INPUT"), pos:0, buf:null, open:true };
+}
+
+function fileOpen(path, mode /* "INPUT"|"OUTPUT"|"I-O"|"EXTEND" */){
+  const fh = _mkFH(path, mode);
+  try {
+    if (mode === "OUTPUT") {
+      fs.writeFileSync(fh.path, "");
+      fh.buf = [];
+    } else if (mode === "EXTEND") {
+      if (!fs.existsSync(fh.path)) fs.writeFileSync(fh.path, "");
+      const t = fs.readFileSync(fh.path, "utf8");
+      fh.buf = t.length ? t.split(/\r?\n/) : [];
+      // EXTEND 的寫入會附加在尾端
+      fh.pos = fh.buf.length;
+    } else { // INPUT / I-O：先當成輸入
+      const t = fs.readFileSync(fh.path, "utf8");
+      fh.buf = t.length ? t.split(/\r?\n/) : [];
+      fh.pos = 0;
+    }
+  } catch (e) {
+    // 檔案不存在或讀取失敗：仍回傳 handle，但當成空集合
+    fh.buf = [];
+    fh.pos = 0;
+  }
+  return fh;
+}
+
+function fileClose(fh){
+  if (!fh) return;
+  fh.open = false;
+}
+
+let _last = { ok:true, status:"00", recordLock:false, notFound:false };
+function setLastStatus(st){
+  // st 可以是 {ok, status, recordLock, notFound}
+  _last = Object.assign({ ok:true, status:"00", recordLock:false, notFound:false }, st||{});
+}
+function lastRecordLock(){ return !!_last.recordLock; }
+function lastNotFound(){ return !!_last.notFound; }
+
+// READ：順序讀一行（沒有索引鍵與鎖，先給最小可用）
+function fileRead(fh, opt){
+  if (!fh || !fh.open) return { ok:false, status:"98", recordLock:false, notFound:true };
+  const noMore = !fh.buf || fh.pos >= fh.buf.length;
+  if (noMore) return { ok:false, status:"10", recordLock:false, notFound:true };
+  const line = fh.buf[fh.pos++];
+  // 這裡不自動寫回任何 record 變數；由上層在 READ 前後自行 MOVE 欄位/KEY（之後可擴充）
+  return { ok:true, status:"00", recordLock:false, notFound:false, line };
+}
+
+function fileWrite(fh, recordStr){
+  try{
+    if (!fh || !fh.path) return { ok:false, status:"98", recordLock:false, notFound:false };
+    fs.appendFileSync(fh.path, String(recordStr||"") + "\n");
+    if (fh.buf) { fh.buf.push(String(recordStr||"")); fh.pos = fh.buf.length; }
+    return { ok:true, status:"00", recordLock:false, notFound:false };
+  }catch(e){
+    return { ok:false, status:"99", recordLock:false, notFound:false };
+  }
+}
+
+// REWRITE：最小 stub（先視為成功；之後可做游標覆寫）
+function fileRewrite(fh, recordStr){
+  // TODO: 可依需求把 fh.pos-1 的那一筆覆蓋；暫時視為成功避免流程中斷
+  return { ok:true, status:"00", recordLock:false, notFound:false };
+}
+
+
 // 匯出給轉譯後的程式使用
 module.exports = {
   alpha, num,
   move, slice, str, cmp, accept, sub,
-  spaces
+  spaces,
+  // 新增：
+  fileOpen, fileClose, fileRead, fileWrite, fileRewrite,
+  setLastStatus, lastRecordLock, lastNotFound
 };
 `

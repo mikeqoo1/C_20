@@ -143,6 +143,9 @@ type env struct {
 	indent  int
 	nameMap map[string]string // 「正規化名」→「此 Program 內第一個對應的 JS 名」
 	gen     *nameGen
+
+	declaredFH  map[string]bool // <file> 對應的 handle 是否已在 main() 宣告
+	declaredVar map[string]bool // 已宣告的 JS 變數（含 *-NAME）
 }
 
 // line：輸出一行（自動依 indent 補兩空白縮排）
@@ -269,8 +272,10 @@ func collectUsedIdents(stmts []ast.Stmt, out map[string]bool) {
 // 3) 輸出 main()：按語句序列化各個節點。
 func emitProgramNode(p *ast.Program) (string, error) {
 	e := &env{
-		nameMap: map[string]string{},
-		gen:     newNameGen(),
+		nameMap:     map[string]string{},
+		gen:         newNameGen(),
+		declaredFH:  map[string]bool{},
+		declaredVar: map[string]bool{},
 	}
 
 	// header（檔頭資訊與 runtime import）
@@ -453,6 +458,76 @@ func emitStmt(e *env, s ast.Stmt) {
 		// 注意：dst 是變數名（以 ident 解析），amount 是任意 Expr。
 		e.line("COBOL.sub(%s, %s);", e.ident(v.Dst), emitExprJS(e, v.Amount))
 
+	case ast.StOpen:
+		// 取得 handle 與路徑欄位
+		fh := e.ensureFH(v.File)
+		// 確保 <PREFIX>-NAME 存在（例如 CVSQB-NAME / ERRD-NAME / APPIN-NAME…）
+		e.ensureAlphaVar(filePathIdent(v.File), 256)
+		pathVar := e.ident(filePathIdent(v.File))
+		e.line("%s = COBOL.fileOpen(COBOL.str(%s), %q);", fh, pathVar, string(v.Mode))
+
+	case ast.StClose:
+		fh := e.ensureFH(v.File)
+		e.line("COBOL.fileClose(%s);", fh)
+
+		// READ
+	case ast.StRead:
+		fh := e.ensureFH(v.File)
+		e.ensureAlphaVar(filePathIdent(v.File), 256)
+		lock := "DEFAULT"
+		switch v.LockMode {
+		case ast.ReadNoLock:
+			lock = "NO"
+		case ast.ReadWithLock:
+			lock = "WITH"
+		}
+		// ⬇️ 用 block 包起來，避免 const __r 二次宣告
+		e.line("{")
+		e.indent++
+		e.line("const __r = COBOL.fileRead(%s, { lock: %q });", fh, lock)
+		e.line("COBOL.setLastStatus(__r);")
+		if len(v.OnInvalid) > 0 {
+			e.line("if (!__r.ok) {")
+			e.indent++
+			for _, s2 := range v.OnInvalid {
+				emitStmt(e, s2)
+			}
+			e.indent--
+			e.line("}")
+		}
+		e.indent--
+		e.line("}")
+
+	case ast.StWrite:
+		base := recordBase(v.Record)
+		fh := e.ensureFH(base + "-F")
+		// ⬇️ 沒有宣告就自動補一個 record buffer
+		e.ensureAlphaVar(v.Record, 4096)
+		rec := e.ident(v.Record)
+		e.line("COBOL.setLastStatus(COBOL.fileWrite(%s, COBOL.str(%s)));", fh, rec)
+
+		// REWRITE
+	case ast.StRewrite:
+		base := recordBase(v.Record)
+		fh := e.ensureFH(base + "-F")
+		e.ensureAlphaVar(v.Record, 4096)
+		// ⬇️ 同樣用 block 避免 const __rw 二次宣告
+		e.line("{")
+		e.indent++
+		e.line("const __rw = COBOL.fileRewrite(%s, COBOL.str(%s));", fh, e.ident(v.Record))
+		e.line("COBOL.setLastStatus(__rw);")
+		if len(v.OnInvalid) > 0 {
+			e.line("if (!__rw.ok) {")
+			e.indent++
+			for _, s2 := range v.OnInvalid {
+				emitStmt(e, s2)
+			}
+			e.indent--
+			e.line("}")
+		}
+		e.indent--
+		e.line("}")
+
 	default:
 		// 未支援語句：留註解便於追蹤
 		e.line("// [TODO not-emitted]: %#v", v)
@@ -543,8 +618,54 @@ func emitBool(e *env, b ast.Bool) string {
 		bb := emitBool(e, v.B)
 		return "(" + a + " || " + bb + ")"
 
+	case ast.IsStatus:
+		if v.Flag == ast.FlagRecordLock {
+			return "COBOL.lastRecordLock()"
+		}
+		if v.Flag == ast.FlagNotFound {
+			return "COBOL.lastNotFound()"
+		}
+		return "false"
+
 	default:
 		return "false"
+	}
+}
+
+// 依 COBOL 慣例，"APPIN-F" 的路徑字串欄位多半叫 "APPIN-NAME"。
+// 這裡用 <prefix>-NAME（prefix 是去掉最後一段 -F/-REC 的部分）。
+func fileBase(name string) string {
+	up := strings.ToUpper(name)
+	if i := strings.LastIndex(up, "-"); i >= 0 {
+		return up[:i]
+	}
+	return up
+}
+
+func filePathIdent(file string) string { return fileBase(file) + "-NAME" }
+
+func recordBase(rec string) string {
+	up := strings.ToUpper(rec)
+	if strings.HasSuffix(up, "-REC") {
+		return strings.TrimSuffix(up, "-REC")
+	}
+	return up
+}
+
+func (e *env) ensureFH(file string) string {
+	js := "_fh_" + jsIdent(strings.ReplaceAll(strings.ToUpper(file), "-", "_"))
+	if !e.declaredFH[js] {
+		e.line("let %s = null;", js)
+		e.declaredFH[js] = true
+	}
+	return js
+}
+
+func (e *env) ensureAlphaVar(ident string, size int) {
+	js := e.ident(ident)
+	if !e.declaredVar[js] {
+		e.line("let %s = COBOL.alpha(%d);", js, size)
+		e.declaredVar[js] = true
 	}
 }
 

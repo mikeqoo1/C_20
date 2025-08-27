@@ -242,3 +242,60 @@ type StSubFrom struct {
 	Dst    string // numeric var
 }
 func (StSubFrom) isStmt() {}
+
+// ─── I/O ─────────────────────────────────────────────────────────────────────
+
+type OpenMode string
+const (
+	OpenInput  OpenMode = "INPUT"
+	OpenOutput OpenMode = "OUTPUT"
+	OpenIO     OpenMode = "I-O"
+	OpenExtend OpenMode = "EXTEND"
+)
+
+type StOpen struct {
+	File string
+	Mode OpenMode
+}
+func (StOpen) isStmt() {}
+
+type StClose struct {
+	File string
+}
+func (StClose) isStmt() {}
+
+type ReadLockMode int
+const (
+	ReadDefault ReadLockMode = iota // 無註記
+	ReadNoLock                      // WITH NO LOCK
+	ReadWithLock                    // WITH LOCK
+)
+
+type StRead struct {
+	File     string
+	LockMode ReadLockMode
+	OnInvalid []Stmt // INVALID KEY ... END-READ（可為空，表示沒有區塊）
+}
+func (StRead) isStmt() {}
+
+type StWrite struct {
+	Record string // 例：APPRP-REC
+}
+func (StWrite) isStmt() {}
+
+type StRewrite struct {
+	Record   string
+	OnInvalid []Stmt // 可能單行（無 END-REWRITE），允許為空
+}
+func (StRewrite) isStmt() {}
+
+// ─── I/O 狀態條件（RECORD-LOCK / NOT-FOUND）────────────────────────────────────
+
+type StsFlag int
+const (
+	FlagRecordLock StsFlag = iota
+	FlagNotFound
+)
+
+type IsStatus struct{ Flag StsFlag }
+func (IsStatus) isBool() {}

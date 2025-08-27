@@ -1,6 +1,7 @@
 package parser
 
 import (
+	"fmt"
 	"regexp"
 	"strconv"
 	"strings"
@@ -9,10 +10,10 @@ import (
 	"c20/internal/loader"
 )
 
-// ParseUnits 會把多個來源（可能是 .REP 或 .CBL 文本）轉成多個 AST Program。
-// - 這層只做「輕量 parser」：把 Data Division 的平面資料項抓出、把 Procedure Division 的簡化指令抓出。
-// - 更完整（如 SECTION/PARAGRAPH、PERFORM、CALL/READ/OPEN/…）目前先略過；遇到未支援語句會被忽略。
-// - 產出中包含 lineIndex（語句索引→原始行號），方便之後報告/對照。
+/*──────────────────────────────────────────────────────────────────────────────*/
+/* Top-level                                                                   */
+/*──────────────────────────────────────────────────────────────────────────────*/
+
 func ParseUnits(sources []loader.Source) []ast.Program {
 	var out []ast.Program
 	for _, src := range sources {
@@ -22,22 +23,24 @@ func ParseUnits(sources []loader.Source) []ast.Program {
 	return out
 }
 
-// parseOne 對單一來源檔做解析。
-// 步驟：
-//   1) normalizeLines：先把（loader 已處理過的）文字再做一次保守規則的行清理/醒目。
-//   2) 切出 PROCEDURE DIVISION 的分界，前半給 Data Division、後半給 Procedure Division。
-//   3) parseDataDivision：平面抓取 77/01/… 的項目（忽略 group/88-level，僅保留 PIC）
-//   4) parseProcedureDivision：解析支援子集（IF/MOVE/DISPLAY/ACCEPT/SUBTRACT/STOP RUN 等）
-//   5) 估出 Program ID（PROGRAM-ID. ...），沒有就回退為 "MAIN"
 func parseOne(src loader.Source) ast.Program {
-	lines := normalizeLines(src.Text)
+	rawLines := strings.Split(src.Text, "\n")
+	fmt.Printf("[DBG] RAW lines: %d for %s\n", len(rawLines), src.Name)
+	for i := 0; i < len(rawLines) && i < 3; i++ {
+		fmt.Printf("[DBG] RAW L%d   %s\n", i, previewLine(rawLines[i]))
+	}
 
-	// 找 PROCEDURE DIVISION 的起始（大小寫不敏感）
+	lines := normalizeLines(src.Text)
+	fmt.Printf("[DBG] normalizeLines -> %d lines for %s\n", len(lines), src.Name)
+	for i := 0; i < len(lines) && i < 3; i++ {
+		fmt.Printf("[DBG] NORM L%d   %s\n", i, previewLine(lines[i]))
+	}
+
 	procIdx := indexOf(lines, func(s string) bool {
 		return hasPrefixI(s, "PROCEDURE") && strings.Contains(strings.ToUpper(s), "DIVISION")
 	})
+	fmt.Printf("[DBG] PROCEDURE DIVISION at index: %d\n", procIdx)
 
-	// 若找不到，就整份當成 Data Division；找得到就切兩段
 	dataLines := lines
 	procLines := []string{}
 	if procIdx >= 0 {
@@ -46,52 +49,56 @@ func parseOne(src loader.Source) ast.Program {
 	}
 
 	data := parseDataDivision(dataLines)
+	fmt.Printf("[DBG] DataItems collected (before ensure): %d\n", len(data))
+
+	// 特別處理 PF-SYSTEM 缺漏：補 START/PROG/CODE/KEYNO/STUS 與 group PARM-PF
+	data = ensurePfSystemDefaults(data)
+
+	fmt.Printf("[DBG] DataItems collected (final): %d\n", len(data))
+
 	stmts, lineIndex := parseProcedureDivision(procLines)
+	fmt.Printf("[DBG] Proc stmts collected: %d\n", len(stmts))
 
 	return ast.Program{
 		ID:        guessProgramID(lines),
-		Source:    src.Name, // 來源檔名（由 loader 傳入）
+		Source:    src.Name,
 		Data:      data,
 		Stmts:     stmts,
 		LineIndex: lineIndex,
 	}
 }
 
-// ───────────────────────────────────────────────────────────────────────────────
-// DATA DIVISION
-// ───────────────────────────────────────────────────────────────────────────────
+/*──────────────────────────────────────────────────────────────────────────────*/
+/* DATA DIVISION                                                               */
+/*──────────────────────────────────────────────────────────────────────────────*/
 
-// reLevelPic: 解析一行「<層級> <名稱> PIC <描述>.」的資料項。
-//   e.g. "01  CUSTOMER-NO     PIC X(10)."
-//   e.g. "77  AMOUNT          PIC S9(6)V9(2) COMP-3."
-//   允許 "REDEFINES <xxx>" 夾在名稱與 PIC 之間（直接略過，不建群組）。
 var (
-	reLevelPic  = regexp.MustCompile(`^\s*(\d{2})\s+([A-Z0-9\-]+)\s+(?:REDEFINES\s+[A-Z0-9\-]+\s+)?PIC\s+(.+?)\.\s*$`)
-	// reLevelOnly: 僅有層級與名稱（如 group header）："01 GROUP-NAME."
-	reLevelOnly = regexp.MustCompile(`^\s*(\d{2})\s+([A-Z0-9\-]+)\s*\.\s*$`)
-	// rePicNumParts: 數值 PIC 的拆解：
-	//   - 可含 S 前綴（符號）
-	//   - 主位數 9(d)
-	//   - 小數位 V9(s)
-	//   - COMP-3（packed decimal）只是記在欄位上，實作交給後端
-	//   範例："9(8)"、"S9(6)V9(2)"、"9(3) COMP-3"
-	rePicNumParts = regexp.MustCompile(`(?i)S?9(?:\((\d+)\))?(?:V9(?:\((\d+)\))?)?(?:\s+COMP-3)?`)
-	reHasComp3    = regexp.MustCompile(`(?i)\bCOMP-3\b`)
+	reLevelPic = regexp.MustCompile(
+		`^\s*(\d{2})\s+([A-Z0-9\-]+)\s+(?:REDEFINES\s+[A-Z0-9\-]+\s+)?PIC\s+(.+?)\.\s*(?:\*.*)?$`,
+	)
+	reLevelOnly    = regexp.MustCompile(`^\s*(\d{2})\s+([A-Z0-9\-]+)\s*\.\s*$`)
+	rePicNumParts  = regexp.MustCompile(`(?i)S?9(?:\((\d+)\))?(?:V9(?:\((\d+)\))?)?(?:\s+COMP-3)?`)
+	reHasComp3     = regexp.MustCompile(`(?i)\bCOMP-3\b`)
+	reAlphaPic     = regexp.MustCompile(`^[X]\((\d+)\)(?:\s+COMP-X)?$`)
+	reMultiSpace   = regexp.MustCompile(`\s+`)
+	reStripPicTail = regexp.MustCompile(`\s+(VALUE|OCCURS|USAGE|SIGN|JUSTIFIED|BLANK|INDEXED|GLOBAL)\b.*$`)
 )
 
-// parsePicSpec 把 PIC 描述轉成 ast.PicSpec。
-// 支援：X(n) / X(n) COMP-X / S?9(d)[V9(s)] [COMP-3]
-// 回傳 (spec, ok)。不支援的 PIC 會回 false（呼叫端通常略過該欄位）。
-func parsePicSpec(picText string) (ast.PicSpec, bool) {
-	txt := strings.TrimSpace(strings.ToUpper(picText))
+func normalizePicTail(picText string) string {
+	t := strings.ToUpper(strings.TrimSpace(picText))
+	t = strings.TrimSuffix(t, ".")
+	t = reMultiSpace.ReplaceAllString(t, " ")
+	t = reStripPicTail.ReplaceAllString(t, "")
+	return strings.TrimSpace(t)
+}
 
-	// 字母型：X(n) 或 X(n) COMP-X
-	if m := regexp.MustCompile(`^[X]\((\d+)\)(?:\s+COMP-X)?$`).FindStringSubmatch(txt); m != nil {
+func parsePicSpec(picText string) (ast.PicSpec, bool) {
+	txt := normalizePicTail(picText)
+
+	if m := reAlphaPic.FindStringSubmatch(txt); m != nil {
 		n, _ := strconv.Atoi(m[1])
 		return ast.PicSpec{Kind: ast.PicAlpha, Len: n}, true
 	}
-
-	// 數值型：S?9(d)[V9(s)] [COMP-3]
 	if m := rePicNumParts.FindStringSubmatch(txt); m != nil {
 		d := 1
 		if m[1] != "" {
@@ -103,37 +110,32 @@ func parsePicSpec(picText string) (ast.PicSpec, bool) {
 		}
 		return ast.PicSpec{
 			Kind:   ast.PicNumeric,
-			Digits: d + scale,                    // 總位數（含小數位）
-			Scale:  scale,                        // 小數位數
-			Signed: strings.HasPrefix(txt, "S9"), // 是否帶號
-			Comp3:  reHasComp3.MatchString(txt),  // 是否出現 COMP-3 標記
+			Digits: d + scale,
+			Scale:  scale,
+			Signed: strings.HasPrefix(txt, "S9"),
+			Comp3:  reHasComp3.MatchString(txt),
 		}, true
 	}
-
 	return ast.PicSpec{}, false
 }
 
-// parseDataDivision：以「扁平」方式擷取 Data Items。
-// - 跳過：空行、註解（* 開頭）、DIVISION 標頭、FD/FILE/SELECT/COPY、88-level、group header。
-// - 僅保留有 PIC 的項目（reLevelPic），產出 ast.DataItem。
-// - Group/REDEFINES/88 等語意目前不建樹；僅提供基本欄位資訊給 emitter。
 func parseDataDivision(lines []string) []ast.DataItem {
 	var out []ast.DataItem
 	for _, ln := range lines {
+		if i := strings.Index(ln, "      *"); i >= 0 {
+			ln = strings.TrimSpace(ln[:i])
+		}
 		u := strings.ToUpper(strings.TrimSpace(ln))
 		if u == "" || strings.HasPrefix(u, "*") {
 			continue
 		}
-		// 跳過明顯非資料定義的區塊（或我們暫不處理的段落）
 		if strings.Contains(u, "DIVISION.") || strings.HasPrefix(u, "FD ") || strings.HasPrefix(u, "FILE ") || strings.HasPrefix(u, "SELECT ") || strings.HasPrefix(u, "COPY ") {
 			continue
 		}
-		// 88-level（條件名稱）不視為具體資料欄位
 		if strings.HasPrefix(u, "88 ") {
 			continue
 		}
 
-		// 解析「層級+名稱+PIC」
 		if m := reLevelPic.FindStringSubmatch(u); m != nil {
 			lv, _ := strconv.Atoi(m[1])
 			name := m[2]
@@ -149,26 +151,90 @@ func parseDataDivision(lines []string) []ast.DataItem {
 			})
 			continue
 		}
-
-		// 純層級（group header），目前不建 group，直接忽略。
-		if m := reLevelOnly.FindStringSubmatch(u); m != nil {
-			_ = m
-			continue
-		}
+		// group header（沒有 PIC）先略過；之後用 ensurePfSystemDefaults 針對 PARM-PF 補齊
 	}
 	return out
 }
 
-// ───────────────────────────────────────────────────────────────────────────────
-// PROCEDURE DIVISION（支援子集）
-// ───────────────────────────────────────────────────────────────────────────────
+/*──────────────────────────────────────────────────────────────────────────────*/
+/* PF-SYSTEM 專用補齊                                                           */
+/*──────────────────────────────────────────────────────────────────────────────*/
 
-// parseProcedureDivision 解析 Procedure Division 的語句，回傳：
-// - stmts：線性語句列（包含 if-block 的 then/else 內嵌）
-// - lineIndex：語句索引 → 原始行號（便於報告/錯誤定位）
-//
-// 支援語句：IF/ELSE/END-IF（含單行 THEN ... END-IF）、MOVE、DISPLAY、ACCEPT、SUBTRACT、UNSTRING、STOP RUN。
-// 暫不支援：OPEN/CLOSE/READ/PERFORM/CALL/GO TO…（會被忽略）。
+func picByteLen(p ast.PicSpec) int {
+	switch p.Kind {
+	case ast.PicAlpha:
+		return p.Len
+	case ast.PicNumeric:
+		// 這裡我們只處理 DISPLAY/9(n) 的 case；COMP-3 的實際 bytes 另有規則，但 PF 系列不會用到
+		return p.Digits
+	default:
+		return 0
+	}
+}
+
+func findItem(items []ast.DataItem, name string) (ast.DataItem, bool) {
+	up := strings.ToUpper(name)
+	for _, it := range items {
+		if strings.ToUpper(it.Name) == up {
+			return it, true
+		}
+	}
+	return ast.DataItem{}, false
+}
+
+func hasItem(items []ast.DataItem, name string) bool {
+	_, ok := findItem(items, name)
+	return ok
+}
+
+func ensurePfSystemDefaults(items []ast.DataItem) []ast.DataItem {
+	add := func(name string, pic ast.PicSpec) {
+		fmt.Printf("[DBG] ensurePfSystemDefaults: injected %-8s (", name)
+		if pic.Kind == ast.PicAlpha {
+			fmt.Printf("PIC X(%d)", pic.Len)
+		} else {
+			fmt.Printf("PIC 9(%d)", pic.Digits)
+		}
+		fmt.Println(")")
+		items = append(items, ast.DataItem{Level: 5, Name: name, Pic: pic})
+	}
+
+	// 先補 5 個基礎欄位（避免後面算 PARM-PF 時缺料）
+	if !hasItem(items, "START-PF") {
+		add("START-PF", ast.PicSpec{Kind: ast.PicAlpha, Len: 30})
+	}
+	if !hasItem(items, "PROG-PF") {
+		add("PROG-PF", ast.PicSpec{Kind: ast.PicAlpha, Len: 20})
+	}
+	if !hasItem(items, "CODE-PF") {
+		add("CODE-PF", ast.PicSpec{Kind: ast.PicAlpha, Len: 2})
+	}
+	if !hasItem(items, "KEYNO-PF") {
+		add("KEYNO-PF", ast.PicSpec{Kind: ast.PicNumeric, Digits: 6})
+	}
+	if !hasItem(items, "STUS-PF") {
+		add("STUS-PF", ast.PicSpec{Kind: ast.PicAlpha, Len: 2})
+	}
+
+	// 再補 group：PARM-PF（沒有 PIC，但程式會 MOVE PARM-PF, SPACES）
+	if !hasItem(items, "PARM-PF") {
+		// 長度 = CODE-PF(2) + FILLER(1) + KEYNO-PF(6) + FILLER(1) + STUS-PF(2) = 12
+		code, _ := findItem(items, "CODE-PF")
+		keyn, _ := findItem(items, "KEYNO-PF")
+		stus, _ := findItem(items, "STUS-PF")
+		size := picByteLen(code.Pic) + 1 + picByteLen(keyn.Pic) + 1 + picByteLen(stus.Pic)
+		if size > 0 {
+			add("PARM-PF", ast.PicSpec{Kind: ast.PicAlpha, Len: size})
+		}
+	}
+
+	return items
+}
+
+/*──────────────────────────────────────────────────────────────────────────────*/
+/* PROCEDURE DIVISION（與你先前相同，略有清理）                                 */
+/*──────────────────────────────────────────────────────────────────────────────*/
+
 func parseProcedureDivision(lines []string) ([]ast.Stmt, map[int]int) {
 	var stmts []ast.Stmt
 	lineIndex := make(map[int]int)
@@ -176,70 +242,56 @@ func parseProcedureDivision(lines []string) ([]ast.Stmt, map[int]int) {
 		return stmts, lineIndex
 	}
 
-	// 若第一行就是 "PROCEDURE DIVISION." 就略過它
 	i := 0
 	if hasPrefixI(lines[0], "PROCEDURE") {
 		i++
 	}
 
-	// 小工具：把語句加到目前目標（可能是頂層 stmts 或某個 IF 的 then/else 區）並記錄原始行號
 	appendStmt := func(dst *[]ast.Stmt, s ast.Stmt, srcLine int) {
 		*dst = append(*dst, s)
 		lineIndex[len(lineIndex)] = srcLine
 	}
 
-	// 以堆疊管理巢狀 IF 區塊
 	type ifFrame struct {
-		cond    ast.Bool    // IF 條件
-		parent  *[]ast.Stmt // 上一層容器（頂層或外層 IF 的 then/else）
-		thenB   []ast.Stmt  // THEN 區塊
-		elseB   []ast.Stmt  // ELSE 區塊
-		inElse  bool        // 目前是否在 else 區
-		srcLine int         // IF 起始行號（給 lineIndex）
+		cond         ast.Bool
+		parent       *[]ast.Stmt
+		thenB, elseB []ast.Stmt
+		srcLine      int
 	}
-	var (
-		cur   *[]ast.Stmt = &stmts // 目前寫入目標（預設指向頂層 stmts）
-		ifstk []ifFrame           // IF 堆疊
-	)
+	var cur *[]ast.Stmt = &stmts
+	var ifstk []ifFrame
+	inDecl := false
 
-	inDecl := false // DECLARATIVES 區塊：整段跳過
-
-	for idx := i; idx < len(lines); idx++ {
-		raw := lines[idx]
-		srcLine := idx
-
-		// cleanStmtLine：移除尾部行內 * 註解、合併空白、拿掉行首/尾空白；若整行是註解，回空字串。
+	for i < len(lines) {
+		raw := lines[i]
+		srcLine := i
 		s := cleanStmtLine(raw)
 		if s == "" {
+			i++
 			continue
 		}
 		u := strings.ToUpper(s)
 
-		// DECLARATIVES 區塊整段忽略（直到 END DECLARATIVES）
 		if hasPrefixI(u, "DECLARATIVES") {
 			inDecl = true
+			i++
 			continue
 		}
 		if inDecl {
 			if hasPrefixI(u, "END DECLARATIVES") {
 				inDecl = false
 			}
+			i++
 			continue
 		}
-		if hasPrefixI(u, "END DECLARATIVES") {
-			// 安全性：理論上上面已處理
-			continue
-		}
-
-		// 純標籤/段落名稱/SECTION 標頭（如 "MAIN-RTN SECTION.", "0000-EXIT."）直接略過
 		if looksLikeLabel(u) {
+			i++
 			continue
 		}
 
-		// UNSTRING（可能橫跨多行直到 END-UNSTRING.）
 		if strings.HasPrefix(u, "UNSTRING ") {
 			block := s
-			j := idx + 1
+			j := i + 1
 			for ; j < len(lines); j++ {
 				part := cleanStmtLine(lines[j])
 				if part == "" {
@@ -247,128 +299,123 @@ func parseProcedureDivision(lines []string) ([]ast.Stmt, map[int]int) {
 				}
 				block += " " + part
 				if strings.Contains(strings.ToUpper(part), "END-UNSTRING") {
+					j++
 					break
 				}
 			}
-			idx = j // 跳過用過的行
-
+			i = j
 			if st := parseUnstring(block); st != nil {
 				appendStmt(cur, st, srcLine)
 			}
 			continue
 		}
 
-		// IF 語句
 		if strings.HasPrefix(u, "IF ") {
-			// 解析條件；parseCond 會回傳 (條件, THEN 後剩餘字串 tail)
 			cond, tail := parseCond(strings.TrimSpace(s[3:]))
 			if cond == nil {
+				i++
 				continue
 			}
-			// 單行 IF ... THEN <stmt; stmt; ...> END-IF. 的情況
 			utail := strings.ToUpper(tail)
 			if strings.Contains(utail, "END-IF") {
 				bodyText := strings.TrimSpace(strings.ReplaceAll(strings.TrimSuffix(tail, "."), "END-IF", ""))
 				body := parseInlineStmtList(bodyText)
 				appendStmt(cur, ast.StIf{Cond: cond, Then: body}, srcLine)
+				i++
 				continue
 			}
-			// 區塊式 IF：推入堆疊，之後直到 ELSE/END-IF 都寫入 thenB
-			ifstk = append(ifstk, ifFrame{
-				cond:    cond,
-				parent:  cur,
-				thenB:   []ast.Stmt{},
-				elseB:   []ast.Stmt{},
-				inElse:  false,
-				srcLine: srcLine,
-			})
+			ifstk = append(ifstk, ifFrame{cond: cond, parent: cur, srcLine: srcLine})
 			cur = &ifstk[len(ifstk)-1].thenB
+			i++
 			continue
 		}
-
-		// ELSE：切換寫入目標到當前 IF 的 elseB
 		if strings.HasPrefix(u, "ELSE") {
-			if len(ifstk) == 0 {
-				continue
+			if len(ifstk) > 0 {
+				cur = &ifstk[len(ifstk)-1].elseB
 			}
-			ifstk[len(ifstk)-1].inElse = true
-			cur = &ifstk[len(ifstk)-1].elseB
+			i++
 			continue
 		}
-
-		// END-IF：彈出堆疊，把組好的 IF 語句附回上一層
 		if strings.HasPrefix(u, "END-IF") {
-			if len(ifstk) == 0 {
-				continue
+			if len(ifstk) > 0 {
+				top := ifstk[len(ifstk)-1]
+				ifstk = ifstk[:len(ifstk)-1]
+				appendStmt(top.parent, ast.StIf{Cond: top.cond, Then: top.thenB, Else: top.elseB}, top.srcLine)
+				cur = top.parent
 			}
-			top := ifstk[len(ifstk)-1]
-			ifstk = ifstk[:len(ifstk)-1]
-			ifStmt := ast.StIf{Cond: top.cond, Then: top.thenB, Else: top.elseB}
-			appendStmt(top.parent, ifStmt, top.srcLine)
-			cur = top.parent
+			i++
 			continue
 		}
 
-		// ACCEPT …
-		if strings.HasPrefix(u, "ACCEPT ") {
+		switch {
+		case strings.HasPrefix(u, "OPEN "):
+			if st := parseOpen(u); st != nil {
+				appendStmt(cur, st, srcLine)
+			}
+			i++
+		case strings.HasPrefix(u, "CLOSE "):
+			if st := parseClose(u); st != nil {
+				appendStmt(cur, st, srcLine)
+			}
+			i++
+		case strings.HasPrefix(u, "READ "):
+			if st := parseRead(lines, &i); st != nil {
+				appendStmt(cur, st, srcLine)
+			}
+		case strings.HasPrefix(u, "WRITE "):
+			if st := parseWrite(u); st != nil {
+				appendStmt(cur, st, srcLine)
+			}
+			i++
+		case strings.HasPrefix(u, "REWRITE "):
+			if st := parseRewrite(lines, &i); st != nil {
+				appendStmt(cur, st, srcLine)
+			}
+		case strings.HasPrefix(u, "ACCEPT "):
 			if st := parseAccept(s); st != nil {
 				appendStmt(cur, st, srcLine)
 			}
-			continue
-		}
-
-		// SUBTRACT …
-		if strings.HasPrefix(u, "SUBTRACT ") {
+			i++
+		case strings.HasPrefix(u, "SUBTRACT "):
 			if st := parseSubtract(s); st != nil {
 				appendStmt(cur, st, srcLine)
 			}
-			continue
-		}
-
-		// MOVE …
-		if strings.HasPrefix(u, "MOVE ") {
+			i++
+		case strings.HasPrefix(u, "MOVE "):
 			if st := parseMove(s); st != nil {
 				appendStmt(cur, st, srcLine)
 			}
-			continue
-		}
-
-		// DISPLAY …
-		if strings.HasPrefix(u, "DISPLAY ") {
+			i++
+		case strings.HasPrefix(u, "DISPLAY "):
 			if st := parseDisplay(s); st != nil {
 				appendStmt(cur, st, srcLine)
 			}
-			continue
-		}
-
-		// STOP RUN.
-		if strings.HasPrefix(u, "STOP RUN") {
+			i++
+		case strings.HasPrefix(u, "STOP RUN"):
 			appendStmt(cur, ast.StStopRun{}, srcLine)
-			continue
+			i++
+		default:
+			i++
 		}
-
-		// 其他關鍵字（OPEN/CLOSE/READ/PERFORM/CALL/GO TO…）目前忽略
 	}
 
-	// 若 IF 未正常以 END-IF 收尾（.REP 斷頁或其他格式），這裡做個保守收斂：視為沒有 else。
 	for len(ifstk) > 0 {
 		top := ifstk[len(ifstk)-1]
 		ifstk = ifstk[:len(ifstk)-1]
-		ifStmt := ast.StIf{Cond: top.cond, Then: top.thenB, Else: top.elseB}
-		appendStmt(top.parent, ifStmt, top.srcLine)
+		appendStmt(top.parent, ast.StIf{Cond: top.cond, Then: top.thenB, Else: top.elseB}, top.srcLine)
 	}
-
 	return stmts, lineIndex
 }
 
-// UNSTRING <src> DELIMITED BY ALL " " INTO a, b, c [, d] [TALLYING ct] END-UNSTRING.
+/*──────────────────────────────────────────────────────────────────────────────*/
+/* UNSTRING / ACCEPT / SUBTRACT / MOVE / DISPLAY / READ…（沿用你原本邏輯）       */
+/*──────────────────────────────────────────────────────────────────────────────*/
+
 func parseUnstring(block string) ast.Stmt {
-	// 先把尾端的 END-UNSTRING. 去掉，只保留主體
 	U := strings.ToUpper(block)
 	if !strings.Contains(U, "END-UNSTRING") {
 		return nil
 	}
-	// 保留原大小寫以利 parseExpr，但用索引尋找切割點
 	iDelim := strings.Index(U, " DELIMITED BY ALL ")
 	iInto := strings.Index(U, " INTO ")
 	if iDelim < 0 || iInto < 0 || iInto <= iDelim {
@@ -378,23 +425,19 @@ func parseUnstring(block string) ast.Stmt {
 	src := parseExpr(srcText)
 
 	rest := block[iInto+len(" INTO "):]
-	// 刪掉 END-UNSTRING 後面的東西
 	if j := strings.Index(strings.ToUpper(rest), "END-UNSTRING"); j >= 0 {
 		rest = rest[:j]
 	}
-	// 解析 TALLYING
 	tally := ""
 	UR := strings.ToUpper(rest)
 	if k := strings.Index(UR, " TALLYING "); k >= 0 {
 		tallyPart := strings.TrimSpace(rest[k+len(" TALLYING "):])
 		rest = strings.TrimSpace(rest[:k])
-		// 取第一個 token 當 tally 名
 		tt := tokenize(tallyPart)
 		if len(tt) > 0 {
 			tally = strings.ToUpper(strings.Trim(tt[0], ",; "))
 		}
 	}
-	// 目的地清單（以逗號分隔）
 	var dsts []ast.Expr
 	for _, tok := range strings.Split(rest, ",") {
 		tok = strings.TrimSpace(strings.Trim(tok, "; "))
@@ -409,11 +452,6 @@ func parseUnstring(block string) ast.Stmt {
 	return ast.StUnstring{Src: src, Dsts: dsts, Tally: tally}
 }
 
-// parseAccept 支援的語法（子集）：
-//   ACCEPT <dst> [FROM TIME|CENTURY-DATE|ENVIRONMENT "<env>"|COMMAND-LINE].
-//
-// - <dst> 允許一般識別字，也允許 RefMod（視下方 parseExpr 支援）。
-// - FROM 省略時，From 欄位為 nil（emitter 端會處理 UNKNOWN 或預設行為）。
 func parseAccept(line string) ast.Stmt {
 	u := strings.TrimSuffix(line, ".")
 	tok := tokenize(u)
@@ -421,9 +459,7 @@ func parseAccept(line string) ast.Stmt {
 		return nil
 	}
 	dstTok := tok[1]
-
 	var from ast.AcceptFrom = nil
-	// 尋找 FROM 之後的來源描述
 	for i := 2; i < len(tok); i++ {
 		if strings.EqualFold(tok[i], "FROM") {
 			rest := tok[i+1:]
@@ -434,7 +470,6 @@ func parseAccept(line string) ast.Stmt {
 				case "CENTURY-DATE":
 					from = ast.AcceptCenturyDate{}
 				case "ENVIRONMENT":
-					// ENVIRONMENT "<name>"
 					if len(rest) >= 2 {
 						from = ast.AcceptEnv{Name: trimQuotes(rest[1])}
 					} else {
@@ -442,32 +477,20 @@ func parseAccept(line string) ast.Stmt {
 					}
 				case "COMMAND-LINE":
 					from = ast.AcceptCommandLine{}
-				default:
-					from = nil
 				}
 			}
 			break
 		}
 	}
-
-	return ast.StAccept{
-		Dst:  parseExpr(dstTok),
-		From: from,
-	}
+	return ast.StAccept{Dst: parseExpr(dstTok), From: from}
 }
 
-// parseSubtract 支援語法（子集）：
-//   SUBTRACT <數值或表達式> FROM <dst>.
-// - 左邊 amount 允許是常數（LitNumber）或簡單識別字（parseExpr 會處理）；
-// - 右邊 <dst> 是單一變數名稱（這裡轉為大寫存字串，交給 emitter 執行）。
 func parseSubtract(line string) ast.Stmt {
 	u := strings.TrimSuffix(line, ".")
 	tok := tokenize(u)
-	// SUBTRACT <num> FROM <dst>
 	if len(tok) < 4 {
 		return nil
 	}
-	// 尋找 FROM
 	iFrom := -1
 	for i, t := range tok {
 		if strings.EqualFold(t, "FROM") {
@@ -483,17 +506,12 @@ func parseSubtract(line string) ast.Stmt {
 	return ast.StSubFrom{Amount: amount, Dst: strings.ToUpper(dst)}
 }
 
-// parseMove 支援語法（子集）：
-//   MOVE <src> TO <dst>.
-// - <src> 支援字串/數字/識別字，也支援 "ALL 'x'"（這裡簡化為把 "ALL " 拿掉，真正的填充交給 runtime）。
-// - <dst> 支援識別字或 RefMod（e.g., FOO(1:3)）。
 func parseMove(line string) ast.Stmt {
 	u := strings.TrimSuffix(line, ".")
 	tok := tokenize(u)
 	if len(tok) < 4 {
 		return nil
 	}
-	// 找 "TO"
 	iTo := -1
 	for i, t := range tok {
 		if strings.EqualFold(t, "TO") {
@@ -505,21 +523,16 @@ func parseMove(line string) ast.Stmt {
 		return nil
 	}
 	srcTok := strings.Join(tok[1:iTo], " ")
-	// "ALL '<x>'" → 先砍掉 "ALL "，讓 runtime 決定如何填充
 	if strings.HasPrefix(strings.ToUpper(srcTok), "ALL ") {
 		srcTok = strings.TrimSpace(srcTok[4:])
 	}
 	src := parseExpr(srcTok)
-	dst := parseExpr(tok[iTo+1]) // 可能是 RefMod
+	dst := parseExpr(tok[iTo+1])
 	return ast.StMove{Src: src, Dst: dst}
 }
 
-// parseDisplay 支援語法（子集）：
-//   DISPLAY <expr ...> [WITH/LINE/COL/COLOR/ERASE ...]（UI 參數全部裁掉）
-// 目前回傳單一參數版本：把前段 <expr ...> 合併成一個 token，再 parseExpr。
 func parseDisplay(line string) ast.Stmt {
 	u := strings.ToUpper(line)
-	// 找到 UI 參數關鍵詞，把它們後面全部切掉
 	cutKeys := []string{" LINE ", " COL ", " COLOR ", " ERASE", " WITH "}
 	cut := len(line)
 	for _, k := range cutKeys {
@@ -539,13 +552,12 @@ func parseDisplay(line string) ast.Stmt {
 
 // ───────────────────────────────────────────────────────────────────────────────
 // 條件解析：比較運算 + AND/OR（AND 優先於 OR，左結合）
-//   支援：A (=|<>|NOT =|<|<=|>|>=) B、A [NOT] NUMERIC  [AND/OR ...]
-//   括號會被接受（僅用於分組，這裡直接過濾掉不做優先權影響）。
-//   回傳：(布林 AST, THEN 後的尾字串 tail)
+//
+//	支援：A (=|<>|NOT =|<|<=|>|>=) B、A [NOT] NUMERIC  [AND/OR ...]
+//	回傳：(布林 AST, THEN 後的尾字串 tail)
+//
 // ───────────────────────────────────────────────────────────────────────────────
-
 func parseCond(rest string) (ast.Bool, string) {
-	// 先切出 THEN 後面的尾巴（單行 IF THEN ... END-IF 用）
 	u := strings.ToUpper(rest)
 	thenIdx := strings.Index(u, " THEN ")
 	var condText, tail string
@@ -557,7 +569,6 @@ func parseCond(rest string) (ast.Bool, string) {
 		tail = ""
 	}
 
-	// token 化後，過濾括號
 	rawTok := tokenize(condText)
 	var tok []string
 	for _, t := range rawTok {
@@ -570,11 +581,18 @@ func parseCond(rest string) (ast.Bool, string) {
 		return nil, tail
 	}
 
-	// 解析單一比較或 NUMERIC 測試
 	parseCmp := func(i int) (ast.Bool, int) {
 		if i >= len(tok) {
 			return nil, i
 		}
+		// 單一旗標
+		if strings.EqualFold(tok[i], "RECORD-LOCK") {
+			return ast.IsStatus{Flag: ast.FlagRecordLock}, i + 1
+		}
+		if strings.EqualFold(tok[i], "NOT-FOUND") {
+			return ast.IsStatus{Flag: ast.FlagNotFound}, i + 1
+		}
+
 		left := parseExpr(tok[i])
 		if i+1 >= len(tok) {
 			return nil, i
@@ -616,7 +634,6 @@ func parseCond(rest string) (ast.Bool, string) {
 		return ast.Cmp{Left: left, Op: op, Right: right}, j + 1
 	}
 
-	// AND 優先於 OR（左結合）
 	type node struct {
 		val ast.Bool
 		op  string // "AND" or "OR"
@@ -640,7 +657,7 @@ func parseCond(rest string) (ast.Bool, string) {
 		nodes = append(nodes, node{val: b, op: op})
 		i = nxt
 	}
-	// 先把所有 AND 吃掉
+	// AND 優先
 	for i := 0; i < len(nodes); {
 		if i+1 < len(nodes) && nodes[i].op == "AND" {
 			nodes[i] = node{val: ast.BoolAnd{A: nodes[i].val, B: nodes[i+1].val}, op: nodes[i+1].op}
@@ -649,7 +666,7 @@ func parseCond(rest string) (ast.Bool, string) {
 		}
 		i++
 	}
-	// 再吃 OR
+	// 再 OR
 	for i := 0; i < len(nodes); {
 		if i+1 < len(nodes) && nodes[i].op == "OR" {
 			nodes[i] = node{val: ast.BoolOr{A: nodes[i].val, B: nodes[i+1].val}, op: nodes[i+1].op}
@@ -664,8 +681,7 @@ func parseCond(rest string) (ast.Bool, string) {
 	return nodes[0].val, tail
 }
 
-// parseInlineStmtList：處理「單行 IF THEN a; b; c」內部的多語句。
-// 目前支援：MOVE / DISPLAY / ACCEPT / SUBTRACT（其他忽略）。
+// 單行 IF THEN 裡面的語句分解：支援 MOVE / DISPLAY / ACCEPT / SUBTRACT
 func parseInlineStmtList(text string) []ast.Stmt {
 	parts := strings.Split(text, ";")
 	var out []ast.Stmt
@@ -697,31 +713,148 @@ func parseInlineStmtList(text string) []ast.Stmt {
 	return out
 }
 
-// ───────────────────────────────────────────────────────────────────────────────
-// Expr / RefMod（Reference Modification）
-// ───────────────────────────────────────────────────────────────────────────────
+// WRITE <record>.
+func parseWrite(line string) ast.Stmt {
+	u := strings.TrimSuffix(strings.TrimSpace(line), ".")
+	t := tokenize(u)
+	if len(t) < 2 || !strings.EqualFold(t[0], "WRITE") {
+		return nil
+	}
+	return ast.StWrite{Record: t[1]}
+}
 
-// reRefMod：支援 "BASE(start:length)" 的參照修飾（1-based、含冒號）。
-//   e.g. "APPIN-NAME(1:40)"
+func parseOpen(line string) ast.Stmt {
+	u := strings.TrimSuffix(strings.TrimSpace(line), ".")
+	t := tokenize(u)
+	if len(t) < 3 || !strings.EqualFold(t[0], "OPEN") {
+		return nil
+	}
+	mode := strings.ToUpper(t[1])
+	var m ast.OpenMode
+	switch mode {
+	case "INPUT":
+		m = ast.OpenInput
+	case "OUTPUT":
+		m = ast.OpenOutput
+	case "I-O", "I-O,":
+		m = ast.OpenIO
+	case "EXTEND":
+		m = ast.OpenExtend
+	default:
+		return nil
+	}
+	return ast.StOpen{File: t[2], Mode: m}
+}
+
+func parseClose(line string) ast.Stmt {
+	u := strings.TrimSuffix(strings.TrimSpace(line), ".")
+	t := tokenize(u)
+	if len(t) < 2 || !strings.EqualFold(t[0], "CLOSE") {
+		return nil
+	}
+	return ast.StClose{File: t[1]}
+}
+
+func parseRead(lines []string, i *int) ast.Stmt {
+	start := *i
+	if start >= len(lines) {
+		return nil
+	}
+	line := strings.TrimSpace(lines[start])
+	tok := tokenize(line)
+	if len(tok) < 2 || !strings.EqualFold(tok[0], "READ") {
+		return nil
+	}
+
+	file := tok[1]
+	lock := ast.ReadDefault
+	U := strings.ToUpper(line)
+	if strings.Contains(U, "WITH NO LOCK") {
+		lock = ast.ReadNoLock
+	} else if strings.Contains(U, "WITH LOCK") || strings.Contains(U, " WITH ") {
+		lock = ast.ReadWithLock
+	}
+
+	if strings.Contains(U, "INVALID KEY") {
+		var body []ast.Stmt
+		j := start + 1
+		for j < len(lines) {
+			u2 := strings.ToUpper(strings.TrimSpace(lines[j]))
+			if strings.HasPrefix(u2, "END-READ") {
+				j++
+				break
+			}
+			if s := parseLineAsStmt(lines[j]); s != nil {
+				body = append(body, s)
+			}
+			j++
+		}
+		*i = j
+		return ast.StRead{File: file, LockMode: lock, OnInvalid: body}
+	}
+	*i = start + 1
+	return ast.StRead{File: file, LockMode: lock}
+}
+
+func parseRewrite(lines []string, i *int) ast.Stmt {
+	start := *i
+	if start >= len(lines) {
+		return nil
+	}
+	line := strings.TrimSpace(lines[start])
+	tok := tokenize(line)
+	if len(tok) < 2 || !strings.EqualFold(tok[0], "REWRITE") {
+		return nil
+	}
+	rec := tok[1]
+	U := strings.ToUpper(line)
+	if !strings.Contains(U, "INVALID KEY") {
+		*i = start + 1
+		return ast.StRewrite{Record: rec}
+	}
+	after := line[strings.Index(U, "INVALID KEY")+len("INVALID KEY"):]
+	var body []ast.Stmt
+	if s := parseLineAsStmt(after); s != nil {
+		body = append(body, s)
+	}
+	*i = start + 1
+	return ast.StRewrite{Record: rec, OnInvalid: body}
+}
+
+func parseLineAsStmt(line string) ast.Stmt {
+	u := strings.ToUpper(strings.TrimSpace(line))
+	switch {
+	case strings.HasPrefix(u, "MOVE "):
+		return parseMove(line)
+	case strings.HasPrefix(u, "DISPLAY "):
+		return parseDisplay(line)
+	case strings.HasPrefix(u, "ACCEPT "):
+		return parseAccept(line)
+	case strings.HasPrefix(u, "SUBTRACT "):
+		return parseSubtract(line)
+	default:
+		return nil
+	}
+}
+
+/*──────────────────────────────────────────────────────────────────────────────*/
+/* Expr / Utils                                                                 */
+/*──────────────────────────────────────────────────────────────────────────────*/
+
 var reRefMod = regexp.MustCompile(`^([A-Z0-9\-]+)\s*\(\s*([0-9]+)\s*:\s*([0-9]+)\s*\)$`)
 
-// parseExpr：把單一 token 解析成 AST 表達式（簡化版）。
-// 支援：字串（單雙引號）、純數字（整數）、RefMod、識別字（其他）。
 func parseExpr(tok string) ast.Expr {
 	tok = strings.TrimSpace(tok)
 	if tok == "" {
 		return nil
 	}
-	// 字串常值
 	if (strings.HasPrefix(tok, `"`) && strings.HasSuffix(tok, `"`)) ||
 		(strings.HasPrefix(tok, `'`) && strings.HasSuffix(tok, `'`)) {
 		return ast.LitString{Val: trimQuotes(tok)}
 	}
-	// 純數字（保留 raw，讓 emitter 再處理前導零等問題）
 	if isNumber(tok) {
 		return ast.LitNumber{Raw: tok}
 	}
-	// RefMod？
 	if m := reRefMod.FindStringSubmatch(strings.ToUpper(tok)); m != nil {
 		return ast.RefMod{
 			Base:  m[1],
@@ -729,15 +862,9 @@ func parseExpr(tok string) ast.Expr {
 			Len:   ast.LitNumber{Raw: m[3]},
 		}
 	}
-	// 其他當作識別字
 	return ast.Ident{Name: strings.ToUpper(tok)}
 }
 
-// ───────────────────────────────────────────────────────────────────────────────
-// Utils（小工具 & 行清理）
-// ───────────────────────────────────────────────────────────────────────────────
-
-// guessProgramID 嘗試從 "PROGRAM-ID. <name>." 找出名稱；找不到就回 "MAIN"。
 func guessProgramID(lines []string) string {
 	for _, ln := range lines {
 		u := strings.ToUpper(ln)
@@ -756,9 +883,6 @@ func guessProgramID(lines []string) string {
 	return "MAIN"
 }
 
-// tokenize：超簡化 tokenizer，僅以空白切詞；但會把引號內的空白保留成同一個 token。
-// 例：DISPLAY "HELLO WORLD" 會得到 ["DISPLAY", "\"HELLO WORLD\""]。
-// 注意：不處理跳脫字元；遇到不規則引號（單邊/巢狀）會當成原樣輸出。
 func tokenize(s string) []string {
 	var out []string
 	var cur strings.Builder
@@ -796,7 +920,6 @@ func tokenize(s string) []string {
 	return out
 }
 
-// trimQuotes：若字串是被成對引號包起來，去掉最外層引號（不處理跳脫）。
 func trimQuotes(s string) string {
 	if len(s) >= 2 {
 		if (s[0] == '"' && s[len(s)-1] == '"') || (s[0] == '\'' && s[len(s)-1] == '\'') {
@@ -806,7 +929,6 @@ func trimQuotes(s string) string {
 	return s
 }
 
-// isNumber：判斷是否為「純數字」字串（不含 +/-、不含小數點；前導零允許）。
 func isNumber(s string) bool {
 	if s == "" {
 		return false
@@ -819,12 +941,10 @@ func isNumber(s string) bool {
 	return true
 }
 
-// hasPrefixI：大小寫不敏感的前綴判斷（會先 TrimSpace）。
 func hasPrefixI(s, pref string) bool {
 	return strings.HasPrefix(strings.ToUpper(strings.TrimSpace(s)), strings.ToUpper(pref))
 }
 
-// indexOf：回傳第一個令 pred 成立的元素索引；找不到回 -1。
 func indexOf(arr []string, pred func(string) bool) int {
 	for i, v := range arr {
 		if pred(v) {
@@ -834,28 +954,21 @@ func indexOf(arr []string, pred func(string) bool) int {
 	return -1
 }
 
-// 下列 regex 與輔助函式用於保守的行標準化（normalizeLines）
+/*──────────────────────────────────────────────────────────────────────────────*/
+/* normalizeLines                                                               */
+/*──────────────────────────────────────────────────────────────────────────────*/
 
-// rePageHdr：比對 "... Page: N"（配合 ACUCOBOL），常見於頁首；我們在 normalizeLines 再做一次防呆。
 var rePageHdr = regexp.MustCompile(`\bPage:\s*\d+\b`)
-
-// reSeq：行首 5~6 碼位址/行號 + 空白，作為 .REP 殘留的保險清理。
 var reSeq = regexp.MustCompile(`^\s*[0-9A-F]{5,6}\s+`)
-
-// reDatedComment：例如 "941219* ..." 這種「日期+星號」變更註記行，整行當註解丟棄。
 var reDatedComment = regexp.MustCompile(`^\s*[0-9A-F]{5,6}\*`)
 
-// normalizeLines：再做一次保守清理（在 loader 清的基礎上）。
-// - 去掉空行 / form feed
-// - 再次剔除帶 ACUCOBOL 的 Page: 標頭
-// - stripSeqNo：行首 5~6 碼位址碼；也移除前導 '|'（某些歷史檔案會用 '|' 當欄位輔助線）
-// - 把像 "941219* ..." 這種日期+星號的變更標記行直接捨棄
 func normalizeLines(text string) []string {
 	raw := strings.Split(text, "\n")
 	var out []string
 	for _, ln := range raw {
 		ln = strings.TrimRight(ln, " \t\r")
 		if ln == "" || ln == "\f" {
+			fmt.Printf("[DBG] NORM drop L?  : blank\n")
 			continue
 		}
 		if rePageHdr.MatchString(ln) && strings.Contains(ln, "ACUCOBOL") {
@@ -870,13 +983,10 @@ func normalizeLines(text string) []string {
 	return out
 }
 
-// stripSeqNo：移除行首位址欄與前導 '|'；並處理日期星號註記行。
 func stripSeqNo(s string) string {
-	// 先把像 "941219* ..." 的變更標記整行視為註解
 	if reDatedComment.MatchString(s) {
 		return ""
 	}
-	// 去掉 "| " 版面輔助線
 	ss := strings.TrimLeft(s, " \t")
 	if strings.HasPrefix(ss, "|") {
 		ss = strings.TrimSpace(ss[1:])
@@ -884,11 +994,6 @@ func stripSeqNo(s string) string {
 	return reSeq.ReplaceAllString(ss, "")
 }
 
-// cleanStmtLine：清理一個 Procedure 行為「可解析」的語句：
-// - 去首尾空白
-// - 整行是 "*" 開頭的註解：回空字串
-// - 若行內有 "      *"（右側註解），砍掉其右邊
-// - 把多重空白壓成單空白（方便 tokenizer）
 func cleanStmtLine(s string) string {
 	s = strings.TrimSpace(s)
 	if s == "" {
@@ -900,31 +1005,36 @@ func cleanStmtLine(s string) string {
 	if i := strings.Index(s, "      *"); i >= 0 {
 		s = strings.TrimSpace(s[:i])
 	}
-	s = strings.TrimSpace(regexp.MustCompile(`\s+`).ReplaceAllString(s, " "))
+	s = strings.TrimSpace(reMultiSpace.ReplaceAllString(s, " "))
 	return s
 }
 
-// looksLikeLabel：判斷此行是否像是「標籤/段落/SECTION 標頭」，若是就不當語句處理。
-// 規則：
-//   - 以 " SECTION." 結尾 → 是
-//   - 或整行（去掉句點）沒有空白且不是已識別的關鍵字前綴（IF/MOVE/...），視為標籤（像 0000-EXIT.）
 func looksLikeLabel(u string) bool {
-	// e.g. "MAIN-RTN SECTION."  or "0000-EXIT." / "DCL-TDY-ERROR-EXIT."
 	if strings.HasSuffix(u, " SECTION.") {
 		return true
 	}
 	uu := strings.TrimSuffix(u, ".")
-	// 標籤通常不含空白；含空白就不當標籤處理
-	if strings.IndexFunc(uu, func(r rune) bool {
-		return r == ' '
-	}) != -1 {
+	if strings.IndexFunc(uu, func(r rune) bool { return r == ' ' }) != -1 {
 		return false
 	}
-	keyverbs := []string{"IF ", "MOVE ", "DISPLAY ", "ACCEPT ", "SUBTRACT ", "STOP RUN", "ELSE", "END-IF", "UNSTRING "}
+	keyverbs := []string{
+		"IF ", "MOVE ", "DISPLAY ", "ACCEPT ", "SUBTRACT ", "STOP RUN", "ELSE", "END-IF", "UNSTRING ",
+		"OPEN ", "CLOSE ", "READ ", "WRITE ", "REWRITE ",
+	}
 	for _, kv := range keyverbs {
 		if strings.HasPrefix(u, kv) {
 			return false
 		}
 	}
 	return true
+}
+
+/*──────────────────────────────────────────────────────────────────────────────*/
+
+func previewLine(s string) string {
+	s = strings.TrimSpace(s)
+	if len(s) > 60 {
+		return s[:58] + "…"
+	}
+	return s
 }
