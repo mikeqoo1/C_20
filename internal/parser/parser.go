@@ -541,6 +541,7 @@ func parseDisplay(line string) ast.Stmt {
 		}
 	}
 	part := strings.TrimSpace(line[:cut])
+	part = strings.TrimSpace(strings.TrimSuffix(part, "."))
 	tok := tokenize(part)
 	if len(tok) < 2 {
 		return nil
