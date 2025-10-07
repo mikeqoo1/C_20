@@ -10,8 +10,9 @@ package ast
 // ─── DATA MODEL ─────────────────────────────────────────────────────────────────
 
 // PicKind 表示 PIC 的大類型（字母/數值）。
-//   PicAlpha   → PIC X(n)
-//   PicNumeric → PIC 9(n) [可含小數位/符號]
+//
+//	PicAlpha   → PIC X(n)
+//	PicNumeric → PIC 9(n) [可含小數位/符號]
 type PicKind int
 
 const (
@@ -25,11 +26,11 @@ const (
 //   - Comp3 保留以後做 decimal/packed 支援（目前 emitter 可能先忽略）。
 type PicSpec struct {
 	Kind   PicKind
-	Len    int   // 只用在 alpha：X(Len)
-	Digits int   // 只用在 numeric：9(Digits)
-	Scale  int   // numeric 的小數位數（9(Digits) 其中的 Scale 位在小數點右側）
-	Signed bool  // numeric 是否允許負號
-	Comp3  bool  // 保留：packed/COMP-3；目前尚未使用，之後整合 decimal.js 時可派上用場
+	Len    int  // 只用在 alpha：X(Len)
+	Digits int  // 只用在 numeric：9(Digits)
+	Scale  int  // numeric 的小數位數（9(Digits) 其中的 Scale 位在小數點右側）
+	Signed bool // numeric 是否允許負號
+	Comp3  bool // 保留：packed/COMP-3；目前尚未使用，之後整合 decimal.js 時可派上用場
 }
 
 // Literal 用於部分資料區塊的初值，或日後可擴充作一般字面量。
@@ -41,10 +42,11 @@ type Literal struct {
 }
 
 // DataItem 代表 DATA DIVISION 中的一個項目（已攤平）。
-//   Level：COBOL 定義的層級（目前主要保留資訊用途）。
-//   Name ：原字段名（例如 FILLER、APPIN-NAME 等，未正規化）。
-//   Pic  ：PIC 規格
-//   Value：可選的初值（像 VALUE "ABC" 或 VALUE 0）
+//
+//	Level：COBOL 定義的層級（目前主要保留資訊用途）。
+//	Name ：原字段名（例如 FILLER、APPIN-NAME 等，未正規化）。
+//	Pic  ：PIC 規格
+//	Value：可選的初值（像 VALUE "ABC" 或 VALUE 0）
 type DataItem struct {
 	Level int
 	Name  string
@@ -53,11 +55,12 @@ type DataItem struct {
 }
 
 // Program 是一個完整的 COBOL 程式單位。
-//   ID     ：PROGRAM-ID（可能為空，emitter 會 fallback 成檔名）
-//   Source ：來源檔完整路徑（便於報告/除錯）
-//   Data   ：已「攤平」的資料項目清單（不含群組階層；emitters 直接使用）
-//   Stmts  ：PROCEDURE DIVISION 轉出的語句序列
-//   LineIndex：將 stmt 索引對應回來源行號（非必要但有助錯誤訊息/追蹤）
+//
+//	ID     ：PROGRAM-ID（可能為空，emitter 會 fallback 成檔名）
+//	Source ：來源檔完整路徑（便於報告/除錯）
+//	Data   ：已「攤平」的資料項目清單（不含群組階層；emitters 直接使用）
+//	Stmts  ：PROCEDURE DIVISION 轉出的語句序列
+//	LineIndex：將 stmt 索引對應回來源行號（非必要但有助錯誤訊息/追蹤）
 type Program struct {
 	ID        string
 	Source    string
@@ -72,29 +75,36 @@ type Program struct {
 type Expr interface{ isExpr() }
 
 // Ident 代表一個變數/欄位名稱（未正規化）。
-//   例：APPIN-NAME、CMD-LINE、ERR-FLAG 等
+//
+//	例：APPIN-NAME、CMD-LINE、ERR-FLAG 等
 type Ident struct{ Name string }
+
 func (Ident) isExpr() {}
 
 // LitString 是字串字面量。
-//   例：DISPLAY "HELLO" → "HELLO" 會以 LitString{Val:"HELLO"} 表示
+//
+//	例：DISPLAY "HELLO" → "HELLO" 會以 LitString{Val:"HELLO"} 表示
 type LitString struct{ Val string }
+
 func (LitString) isExpr() {}
 
 // LitNumber 是數字字面量，使用原始字串保留前導零等格式。
-//   例：'001' 會保留 Raw:"001"。emitter 端（像 Node）再把它轉為十進位避免八進位誤判。
+//
+//	例：'001' 會保留 Raw:"001"。emitter 端（像 Node）再把它轉為十進位避免八進位誤判。
 type LitNumber struct{ Raw string }
+
 func (LitNumber) isExpr() {}
 
 // RefMod 表示 COBOL 的 reference modification（切片）語法：BASE(start:length)
 //   - Base  ：底層欄位名（未正規化）
 //   - Start ：起始位置（1-based），通常是 LitNumber
 //   - Len   ：長度，通常是 LitNumber
-//   例：MOVE "A" TO APPIN-NAME(3:1) → RefMod{Base:"APPIN-NAME", Start:1, Len:1}
+//     例：MOVE "A" TO APPIN-NAME(3:1) → RefMod{Base:"APPIN-NAME", Start:1, Len:1}
 type RefMod struct {
 	Base       string
 	Start, Len Expr // 通常是 LitNumber，但保留為 Expr 以利以後表達式擴充
 }
+
 func (RefMod) isExpr() {}
 
 // ─── BOOL / CONDITIONS（條件） ─────────────────────────────────────────────────
@@ -106,12 +116,12 @@ type Bool interface{ isBool() }
 type CmpOp string
 
 const (
-	OpEQ CmpOp = "="   // =
-	OpNE CmpOp = "<>"  // <>
-	OpLT CmpOp = "<"   // <
-	OpLE CmpOp = "<="  // <=
-	OpGT CmpOp = ">"   // >
-	OpGE CmpOp = ">="  // >=
+	OpEQ CmpOp = "="  // =
+	OpNE CmpOp = "<>" // <>
+	OpLT CmpOp = "<"  // <
+	OpLE CmpOp = "<=" // <=
+	OpGT CmpOp = ">"  // >
+	OpGE CmpOp = ">=" // >=
 )
 
 // Cmp 是二元比較：Left <op> Right。
@@ -122,23 +132,27 @@ type Cmp struct {
 	Op    CmpOp
 	Right Expr
 }
+
 func (Cmp) isBool() {}
 
 // BoolAnd / BoolOr：支援複合條件（短路行為交由 emitter 實作）。
 type BoolAnd struct{ A, B Bool }
+
 func (BoolAnd) isBool() {}
 
 type BoolOr struct{ A, B Bool }
+
 func (BoolOr) isBool() {}
 
 // IsNumeric 對應條件「<expr> NUMERIC / NOT NUMERIC」的最小型 AST。
 //   - Expr：被測試的運算式（通常是欄位或字面值）
 //   - Neg ：true 代表 NOT NUMERIC
-//   emitter(Node) 端以 runtime 的 isNumericStr() 實作。
+//     emitter(Node) 端以 runtime 的 isNumericStr() 實作。
 type IsNumeric struct {
 	Expr Expr
 	Neg  bool // true = NOT NUMERIC
 }
+
 func (IsNumeric) isBool() {}
 
 // ─── STMTS（語句） ─────────────────────────────────────────────────────────────
@@ -147,8 +161,10 @@ func (IsNumeric) isBool() {}
 type Stmt interface{ isStmt() }
 
 // StDisplay 對應 COBOL DISPLAY，可接受多個引數。
-//   例：DISPLAY "A" APPIN-NAME
+//
+//	例：DISPLAY "A" APPIN-NAME
 type StDisplay struct{ Args []Expr }
+
 func (StDisplay) isStmt() {}
 
 // StMove 對應 MOVE 語句：MOVE Src TO Dst。
@@ -159,7 +175,22 @@ type StMove struct {
 	Src Expr
 	Dst Expr // Ident or RefMod
 }
+
 func (StMove) isStmt() {}
+
+// StBinaryMath 代表最簡化的二元運算（加減乘除）並把結果寫入 Dst。
+//   - Op   ：允許值為 "+", "-", "*", "/"。
+//   - Left / Right：左右運算元（Ident / LitNumber / RefMod）。
+//   - Dst  ：目的欄位（通常是 Ident 或 RefMod）。
+//
+// 目前用來支援 COMPUTE、ADD ... GIVING、SUBTRACT ... GIVING、MULTIPLY/DIVIDE ... GIVING。
+type StBinaryMath struct {
+	Op          string
+	Left, Right Expr
+	Dst         Expr
+}
+
+func (StBinaryMath) isStmt() {}
 
 // StIf 對應 IF/ELSE（ELSE 可為空）。
 type StIf struct {
@@ -167,14 +198,17 @@ type StIf struct {
 	Then []Stmt
 	Else []Stmt
 }
+
 func (StIf) isStmt() {}
 
 // StPerformUntil 對應 PERFORM ... UNTIL <Cond>。
-//   在 emitter（Node）以 while(!(Cond)) { body } 近似實現。
+//
+//	在 emitter（Node）以 while(!(Cond)) { body } 近似實現。
 type StPerformUntil struct {
 	Cond Bool
 	Body []Stmt
 }
+
 func (StPerformUntil) isStmt() {}
 
 // StPerformVarying 對應 PERFORM VARYING 變數 FROM x BY y UNTIL <Cond>。
@@ -183,26 +217,30 @@ func (StPerformUntil) isStmt() {}
 //   - Cond   ：直到條件（Bool）
 //   - Body   ：迴圈主體語句
 type StPerformVarying struct {
-	VarName string
+	VarName  string
 	From, By Expr
 	Cond     Bool
 	Body     []Stmt
 }
+
 func (StPerformVarying) isStmt() {}
 
 // StStopRun 對應 STOP RUN。
 type StStopRun struct{}
+
 func (StStopRun) isStmt() {}
 
 // StUnstring 對應 UNSTRING 的最小子集：
-//   UNSTRING <Src> DELIMITED BY ALL " " INTO a, b, c [, d] [TALLYING ct] END-UNSTRING.
-//   - 我們目前只支援「以一個或多個空白切割」並把結果依序放到 Dsts；不足的補空字串，多的截掉。
-//   - Tally：若有指定，emitter 會寫入實際「被賦值的欄位數」。
+//
+//	UNSTRING <Src> DELIMITED BY ALL " " INTO a, b, c [, d] [TALLYING ct] END-UNSTRING.
+//	- 我們目前只支援「以一個或多個空白切割」並把結果依序放到 Dsts；不足的補空字串，多的截掉。
+//	- Tally：若有指定，emitter 會寫入實際「被賦值的欄位數」。
 type StUnstring struct {
 	Src   Expr   // 通常是 Ident（例如 CMD-LINE）
 	Dsts  []Expr // 通常是 Ident；允許 RefMod 但目前 emitter 會當一般目的地處理
 	Tally string // 可為空字串（表示未指定）
 }
+
 func (StUnstring) isStmt() {}
 
 // StAccept 對應 ACCEPT 語句：ACCEPT <Dst> [FROM <source>]。
@@ -212,26 +250,32 @@ type StAccept struct {
 	Dst  Expr
 	From AcceptFrom
 }
+
 func (StAccept) isStmt() {}
 
 // AcceptFrom 是 ACCEPT 的來源分類的共同介面。
-//   實作型別對應 COBOL 常見幾種來源。
+//
+//	實作型別對應 COBOL 常見幾種來源。
 type AcceptFrom interface{ isAccept() }
 
 // ACCEPT ... FROM TIME
 type AcceptTime struct{}
+
 func (AcceptTime) isAccept() {}
 
 // ACCEPT ... FROM CENTURY-DATE
 type AcceptCenturyDate struct{}
+
 func (AcceptCenturyDate) isAccept() {}
 
 // ACCEPT ... FROM ENVIRONMENT "NAME"
 type AcceptEnv struct{ Name string }
+
 func (AcceptEnv) isAccept() {}
 
 // ACCEPT ... FROM COMMAND-LINE
 type AcceptCommandLine struct{}
+
 func (AcceptCommandLine) isAccept() {}
 
 // StSubFrom 對應 SUBTRACT <amount> FROM <dst>。
@@ -241,11 +285,23 @@ type StSubFrom struct {
 	Amount Expr
 	Dst    string // numeric var
 }
+
 func (StSubFrom) isStmt() {}
+
+// StInitialize 對應 INITIALIZE 語句（簡化版本）。
+//   - Targets：要初始化的欄位
+//   - ReplaceNumeric：若指定 "REPLACING NUMERIC DATA BY ..."，保存該運算式（允許為 nil）
+type StInitialize struct {
+	Targets        []Expr
+	ReplaceNumeric Expr
+}
+
+func (StInitialize) isStmt() {}
 
 // ─── I/O ─────────────────────────────────────────────────────────────────────
 
 type OpenMode string
+
 const (
 	OpenInput  OpenMode = "INPUT"
 	OpenOutput OpenMode = "OUTPUT"
@@ -257,45 +313,53 @@ type StOpen struct {
 	File string
 	Mode OpenMode
 }
+
 func (StOpen) isStmt() {}
 
 type StClose struct {
 	File string
 }
+
 func (StClose) isStmt() {}
 
 type ReadLockMode int
+
 const (
-	ReadDefault ReadLockMode = iota // 無註記
-	ReadNoLock                      // WITH NO LOCK
-	ReadWithLock                    // WITH LOCK
+	ReadDefault  ReadLockMode = iota // 無註記
+	ReadNoLock                       // WITH NO LOCK
+	ReadWithLock                     // WITH LOCK
 )
 
 type StRead struct {
-	File     string
-	LockMode ReadLockMode
+	File      string
+	LockMode  ReadLockMode
 	OnInvalid []Stmt // INVALID KEY ... END-READ（可為空，表示沒有區塊）
 }
+
 func (StRead) isStmt() {}
 
 type StWrite struct {
 	Record string // 例：APPRP-REC
 }
+
 func (StWrite) isStmt() {}
 
 type StRewrite struct {
-	Record   string
+	Record    string
 	OnInvalid []Stmt // 可能單行（無 END-REWRITE），允許為空
 }
+
 func (StRewrite) isStmt() {}
 
 // ─── I/O 狀態條件（RECORD-LOCK / NOT-FOUND）────────────────────────────────────
 
 type StsFlag int
+
 const (
 	FlagRecordLock StsFlag = iota
 	FlagNotFound
 )
 
 type IsStatus struct{ Flag StsFlag }
+
 func (IsStatus) isBool() {}

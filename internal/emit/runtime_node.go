@@ -142,6 +142,24 @@ function spaces(dstLike) {
   return " ".repeat(alphaLen(dstLike));
 }
 
+function numVal(x) {
+  if (typeof x === "number") {
+    return x|0;
+  }
+  if (isNum(x)) {
+    return x.value|0;
+  }
+  if (isAlpha(x) || isAlphaSlice(x)) {
+    const t = alphaGet(x).trim();
+    return /^\s*[+-]?\d+\s*$/.test(t) ? (parseInt(t, 10)|0) : 0;
+  }
+  if (typeof x === "string") {
+    const t = x.trim();
+    return /^\s*[+-]?\d+\s*$/.test(t) ? (parseInt(t, 10)|0) : 0;
+  }
+  return 0;
+}
+
 // ───────────────────── REFMOD（slice） ─────────────────────
 //
 // COBOL.slice(base, start, len)
@@ -391,7 +409,7 @@ function fileRewrite(fh, recordStr){
 module.exports = {
   alpha, num,
   move, slice, str, cmp, accept, sub,
-  spaces,
+  spaces, numVal,
   // 新增：
   fileOpen, fileClose, fileRead, fileWrite, fileRewrite,
   setLastStatus, lastRecordLock, lastNotFound

@@ -110,8 +110,10 @@ func jsDec(raw string) string {
 		return "0"
 	}
 	sign := ""
-	if s[0] == '-' {
-		sign = "-"
+	if s[0] == '-' || s[0] == '+' {
+		if s[0] == '-' {
+			sign = "-"
+		}
 		s = s[1:]
 	}
 	s = strings.TrimLeft(s, "0")
@@ -146,6 +148,7 @@ type env struct {
 
 	declaredFH  map[string]bool // <file> 對應的 handle 是否已在 main() 宣告
 	declaredVar map[string]bool // 已宣告的 JS 變數（含 *-NAME）
+	dataSpecs   map[string]ast.PicSpec
 }
 
 // line：輸出一行（自動依 indent 補兩空白縮排）
@@ -222,6 +225,10 @@ func collectUsedIdents(stmts []ast.Stmt, out map[string]bool) {
 		case ast.StMove:
 			walkExpr(v.Src)
 			walkExpr(v.Dst)
+		case ast.StBinaryMath:
+			walkExpr(v.Left)
+			walkExpr(v.Right)
+			walkExpr(v.Dst)
 		case ast.StIf:
 			walkBool(v.Cond)
 			for _, t := range v.Then {
@@ -251,6 +258,13 @@ func collectUsedIdents(stmts []ast.Stmt, out map[string]bool) {
 			// SUBTRACT <amount> FROM <dst>：dst 必定是識別字
 			out[jsIdent(v.Dst)] = true
 			walkExpr(v.Amount)
+		case ast.StInitialize:
+			for _, t := range v.Targets {
+				walkExpr(t)
+			}
+			if v.ReplaceNumeric != nil {
+				walkExpr(v.ReplaceNumeric)
+			}
 		case ast.StStopRun:
 			// no-op
 		default:
@@ -276,6 +290,7 @@ func emitProgramNode(p *ast.Program) (string, error) {
 		gen:         newNameGen(),
 		declaredFH:  map[string]bool{},
 		declaredVar: map[string]bool{},
+		dataSpecs:   map[string]ast.PicSpec{},
 	}
 
 	// header（檔頭資訊與 runtime import）
@@ -290,6 +305,12 @@ func emitProgramNode(p *ast.Program) (string, error) {
 
 	// 1) 宣告 DATA DIVISION 欄位
 	declared := map[string]bool{} // 用正規化名記錄「已宣告」
+	type dataInit struct {
+		jsName string
+		lit    *ast.Literal
+		pic    ast.PicSpec
+	}
+	var dataInits []dataInit
 	for _, d := range p.Data {
 		jsName := e.gen.uniq(d.Name) // 針對 FILLER 等重名做唯一化
 
@@ -299,6 +320,8 @@ func emitProgramNode(p *ast.Program) (string, error) {
 			e.nameMap[base] = jsName
 		}
 		declared[base] = true
+		e.dataSpecs[jsName] = d.Pic
+		e.dataSpecs[base] = d.Pic
 
 		// 依 PIC 類型輸出對應 runtime 建構子
 		switch d.Pic.Kind {
@@ -310,8 +333,20 @@ func emitProgramNode(p *ast.Program) (string, error) {
 			// 安全保守：未知就當成一位元 Alpha
 			e.line("const %s = COBOL.alpha(%d); // PIC ?", jsName, 1)
 		}
+		if d.Value != nil {
+			dataInits = append(dataInits, dataInit{jsName: jsName, lit: d.Value, pic: d.Pic})
+		}
 	}
 	e.line("")
+	if len(dataInits) > 0 {
+		for _, init := range dataInits {
+			litJS := literalToJS(init.pic, init.lit)
+			if litJS != "" {
+				e.line("COBOL.move(%s, %s);", init.jsName, litJS)
+			}
+		}
+		e.line("")
+	}
 
 	// 2) auto-declare：把「有使用但未宣告」的識別字補成 Alpha(80)
 	//    範例：ACCEPT CMD-LINE FROM COMMAND-LINE → 會自動輸出：
@@ -361,6 +396,7 @@ func emitProgramNode(p *ast.Program) (string, error) {
 // - COBOL.str(x) / COBOL.move(dst, src) / COBOL.slice(base, start, len)
 // - COBOL.accept(dst, {from: "TIME"|"CENTURY-DATE"|"ENV"| "COMMAND-LINE", name?})
 // - COBOL.cmp(a, op, b) / COBOL.spaces(x) / COBOL.sub(dstVar, amount)
+// - COBOL.numVal(expr) → 取得數值表示（支援 alpha/num）
 func emitStmt(e *env, s ast.Stmt) {
 	switch v := s.(type) {
 
@@ -371,6 +407,17 @@ func emitStmt(e *env, s ast.Stmt) {
 			parts = append(parts, "COBOL.str("+emitExprJS(e, a)+")")
 		}
 		e.line("console.log(%s);", strings.Join(parts, ", "))
+
+	case ast.StBinaryMath:
+		left := emitNumValue(e, v.Left)
+		right := emitNumValue(e, v.Right)
+		dstJS, _ := emitLHSAndBase(e, v.Dst)
+		e.line("{")
+		e.indent++
+		e.line("const __tmp = %s %s %s;", left, v.Op, right)
+		e.line("COBOL.move(%s, __tmp);", dstJS)
+		e.indent--
+		e.line("}")
 
 	case ast.StMove:
 		// MOVE <src> TO <dst>
@@ -457,6 +504,20 @@ func emitStmt(e *env, s ast.Stmt) {
 		// SUBTRACT <amount> FROM <dst>
 		// 注意：dst 是變數名（以 ident 解析），amount 是任意 Expr。
 		e.line("COBOL.sub(%s, %s);", e.ident(v.Dst), emitExprJS(e, v.Amount))
+
+	case ast.StInitialize:
+		for _, t := range v.Targets {
+			dstJS, base := emitLHSAndBase(e, t)
+			if v.ReplaceNumeric != nil {
+				e.line("COBOL.move(%s, %s);", dstJS, emitExprJS(e, v.ReplaceNumeric))
+				continue
+			}
+			if spec, ok := e.dataSpecs[baseIdent(t)]; ok && spec.Kind == ast.PicNumeric {
+				e.line("COBOL.move(%s, 0);", dstJS)
+			} else {
+				e.line("COBOL.move(%s, COBOL.spaces(%s));", dstJS, base)
+			}
+		}
 
 	case ast.StOpen:
 		// 取得 handle 與路徑欄位
@@ -559,6 +620,27 @@ func emitExprJS(e *env, expr ast.Expr) string {
 	}
 }
 
+func emitNumValue(e *env, expr ast.Expr) string {
+	return fmt.Sprintf("COBOL.numVal(%s)", emitExprJS(e, expr))
+}
+
+func literalToJS(pic ast.PicSpec, lit *ast.Literal) string {
+	if lit == nil {
+		return ""
+	}
+	switch strings.ToLower(lit.Kind) {
+	case "string":
+		return q(lit.Str)
+	case "number":
+		return jsDec(lit.Str)
+	default:
+		if pic.Kind == ast.PicAlpha {
+			return q(lit.Str)
+		}
+		return jsDec(lit.Str)
+	}
+}
+
 // emitLHSAndBase：針對 MOVE/ACCEPT 等「需要左值」的語句，
 // 取得左值對應的 JS 表達式（可為 slice）與它的底層「base 變數名」。
 // 用處：MOVE SPACES TO FOO(1:3) 需要知道 base=FOO 以便 COBOL.spaces(FOO) 生成正確長度。
@@ -575,6 +657,17 @@ func emitLHSAndBase(e *env, dst ast.Expr) (dstJS string, baseJS string) {
 	default:
 		// 例外狀況：當作一般表達式處理（避免中斷）
 		return emitExprJS(e, dst), emitExprJS(e, dst)
+	}
+}
+
+func baseIdent(expr ast.Expr) string {
+	switch v := expr.(type) {
+	case ast.Ident:
+		return jsIdent(v.Name)
+	case ast.RefMod:
+		return jsIdent(v.Base)
+	default:
+		return ""
 	}
 }
 

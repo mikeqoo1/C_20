@@ -139,7 +139,18 @@ func parseDataDivision(lines []string) []ast.DataItem {
 		if m := reLevelPic.FindStringSubmatch(u); m != nil {
 			lv, _ := strconv.Atoi(m[1])
 			name := m[2]
-			picText := m[3]
+			rawPic := strings.TrimSpace(m[3])
+			picText := rawPic
+			var initVal *ast.Literal
+			upper := strings.ToUpper(rawPic)
+			if idx := strings.Index(upper, " VALUE "); idx >= 0 {
+				picText = strings.TrimSpace(rawPic[:idx])
+				valPart := strings.TrimSpace(rawPic[idx+len(" VALUE "):])
+				if strings.HasPrefix(strings.ToUpper(valPart), "IS ") {
+					valPart = strings.TrimSpace(valPart[3:])
+				}
+				initVal = parseValueLiteral(valPart)
+			}
 			pic, ok := parsePicSpec(picText)
 			if !ok {
 				continue
@@ -148,6 +159,7 @@ func parseDataDivision(lines []string) []ast.DataItem {
 				Level: lv,
 				Name:  name,
 				Pic:   pic,
+				Value: initVal,
 			})
 			continue
 		}
@@ -381,6 +393,31 @@ func parseProcedureDivision(lines []string) ([]ast.Stmt, map[int]int) {
 				appendStmt(cur, st, srcLine)
 			}
 			i++
+		case strings.HasPrefix(u, "ADD "):
+			if st := parseAdd(s); st != nil {
+				appendStmt(cur, st, srcLine)
+			}
+			i++
+		case strings.HasPrefix(u, "DIVIDE "):
+			if st := parseDivide(s); st != nil {
+				appendStmt(cur, st, srcLine)
+			}
+			i++
+		case strings.HasPrefix(u, "MULTIPLY "):
+			if st := parseMultiply(s); st != nil {
+				appendStmt(cur, st, srcLine)
+			}
+			i++
+		case strings.HasPrefix(u, "COMPUTE "):
+			if st := parseCompute(s); st != nil {
+				appendStmt(cur, st, srcLine)
+			}
+			i++
+		case strings.HasPrefix(u, "INITIALIZE "):
+			if st := parseInitialize(s); st != nil {
+				appendStmt(cur, st, srcLine)
+			}
+			i++
 		case strings.HasPrefix(u, "MOVE "):
 			if st := parseMove(s); st != nil {
 				appendStmt(cur, st, srcLine)
@@ -501,9 +538,216 @@ func parseSubtract(line string) ast.Stmt {
 	if iFrom < 0 || iFrom+1 >= len(tok) {
 		return nil
 	}
+	iGiving := -1
+	for i := iFrom + 1; i < len(tok); i++ {
+		if strings.EqualFold(tok[i], "GIVING") {
+			iGiving = i
+			break
+		}
+	}
 	amount := parseExpr(strings.Join(tok[1:iFrom], " "))
 	dst := tok[iFrom+1]
+	if iGiving > 0 && iGiving+1 < len(tok) {
+		giving := parseExpr(tok[iGiving+1])
+		if amount != nil && giving != nil {
+			fromExpr := parseExpr(dst)
+			return ast.StBinaryMath{Op: "-", Left: fromExpr, Right: amount, Dst: giving}
+		}
+	}
 	return ast.StSubFrom{Amount: amount, Dst: strings.ToUpper(dst)}
+}
+
+func parseAdd(line string) ast.Stmt {
+	u := strings.TrimSuffix(line, ".")
+	tok := tokenize(u)
+	if len(tok) < 4 {
+		return nil
+	}
+	iGiving := -1
+	for i, t := range tok {
+		if strings.EqualFold(t, "GIVING") {
+			iGiving = i
+			break
+		}
+	}
+	if iGiving < 0 || iGiving+1 >= len(tok) {
+		return nil
+	}
+	iTo := -1
+	for i := 1; i < iGiving; i++ {
+		if strings.EqualFold(tok[i], "TO") {
+			iTo = i
+			break
+		}
+	}
+	if iTo < 0 || iTo+1 >= iGiving {
+		return nil
+	}
+	addTok := strings.TrimSpace(strings.Join(tok[1:iTo], " "))
+	if addTok == "" {
+		return nil
+	}
+	addExpr := parseExpr(addTok)
+	toExpr := parseExpr(tok[iTo+1])
+	giving := parseExpr(tok[iGiving+1])
+	if addExpr == nil || toExpr == nil || giving == nil {
+		return nil
+	}
+	return ast.StBinaryMath{Op: "+", Left: toExpr, Right: addExpr, Dst: giving}
+}
+
+func parseDivide(line string) ast.Stmt {
+	u := strings.TrimSuffix(line, ".")
+	tok := tokenize(u)
+	if len(tok) < 5 {
+		return nil
+	}
+	iBy := -1
+	for i := 1; i < len(tok); i++ {
+		if strings.EqualFold(tok[i], "BY") {
+			iBy = i
+			break
+		}
+	}
+	if iBy < 0 || iBy+1 >= len(tok) {
+		return nil
+	}
+	iGiving := -1
+	for i := iBy + 1; i < len(tok); i++ {
+		if strings.EqualFold(tok[i], "GIVING") {
+			iGiving = i
+			break
+		}
+	}
+	if iGiving < 0 || iGiving+1 >= len(tok) {
+		return nil
+	}
+	left := parseExpr(strings.TrimSpace(strings.Join(tok[1:iBy], " ")))
+	right := parseExpr(tok[iBy+1])
+	giving := parseExpr(tok[iGiving+1])
+	if left == nil || right == nil || giving == nil {
+		return nil
+	}
+	return ast.StBinaryMath{Op: "/", Left: left, Right: right, Dst: giving}
+}
+
+func parseMultiply(line string) ast.Stmt {
+	u := strings.TrimSuffix(line, ".")
+	tok := tokenize(u)
+	if len(tok) < 5 {
+		return nil
+	}
+	iBy := -1
+	for i := 1; i < len(tok); i++ {
+		if strings.EqualFold(tok[i], "BY") {
+			iBy = i
+			break
+		}
+	}
+	if iBy < 0 || iBy+1 >= len(tok) {
+		return nil
+	}
+	iGiving := -1
+	for i := iBy + 1; i < len(tok); i++ {
+		if strings.EqualFold(tok[i], "GIVING") {
+			iGiving = i
+			break
+		}
+	}
+	if iGiving < 0 || iGiving+1 >= len(tok) {
+		return nil
+	}
+	left := parseExpr(strings.TrimSpace(strings.Join(tok[1:iBy], " ")))
+	right := parseExpr(tok[iBy+1])
+	giving := parseExpr(tok[iGiving+1])
+	if left == nil || right == nil || giving == nil {
+		return nil
+	}
+	return ast.StBinaryMath{Op: "*", Left: left, Right: right, Dst: giving}
+}
+
+func parseCompute(line string) ast.Stmt {
+	text := strings.TrimSpace(strings.TrimSuffix(line, "."))
+	tok := tokenize(text)
+	if len(tok) < 4 {
+		return nil
+	}
+	dst := parseExpr(tok[1])
+	if dst == nil {
+		return nil
+	}
+	iEq := -1
+	for i := 2; i < len(tok); i++ {
+		if tok[i] == "=" {
+			iEq = i
+			break
+		}
+	}
+	if iEq < 0 || iEq+1 >= len(tok) {
+		return nil
+	}
+	exprTok := append([]string{}, tok[iEq+1:]...)
+	if len(exprTok) < 3 {
+		return nil
+	}
+	exprTok[0] = strings.TrimLeft(exprTok[0], "(")
+	lastIdx := len(exprTok) - 1
+	exprTok[lastIdx] = strings.TrimRight(exprTok[lastIdx], ")")
+	if len(exprTok) != 3 {
+		return nil
+	}
+	left := parseExpr(exprTok[0])
+	if left == nil {
+		return nil
+	}
+	op := exprTok[1]
+	if op != "+" && op != "-" && op != "*" && op != "/" {
+		return nil
+	}
+	right := parseExpr(exprTok[2])
+	if right == nil {
+		return nil
+	}
+	return ast.StBinaryMath{Op: op, Left: left, Right: right, Dst: dst}
+}
+
+func parseInitialize(line string) ast.Stmt {
+	u := strings.TrimSuffix(line, ".")
+	tok := tokenize(u)
+	if len(tok) < 2 {
+		return nil
+	}
+	var targets []ast.Expr
+	i := 1
+	for ; i < len(tok); i++ {
+		if strings.EqualFold(tok[i], "REPLACING") {
+			break
+		}
+		ex := parseExpr(tok[i])
+		if ex != nil {
+			targets = append(targets, ex)
+		}
+	}
+	if len(targets) == 0 {
+		return nil
+	}
+	var replace ast.Expr
+	if i < len(tok) && strings.EqualFold(tok[i], "REPLACING") {
+		i++
+		if i < len(tok) && strings.EqualFold(tok[i], "NUMERIC") {
+			i++
+		}
+		if i < len(tok) && strings.EqualFold(tok[i], "DATA") {
+			i++
+		}
+		if i < len(tok) && strings.EqualFold(tok[i], "BY") {
+			i++
+		}
+		if i < len(tok) {
+			replace = parseExpr(tok[i])
+		}
+	}
+	return ast.StInitialize{Targets: targets, ReplaceNumeric: replace}
 }
 
 func parseMove(line string) ast.Stmt {
@@ -546,9 +790,20 @@ func parseDisplay(line string) ast.Stmt {
 	if len(tok) < 2 {
 		return nil
 	}
-	arg := strings.Join(tok[1:], " ")
-	ex := parseExpr(arg)
-	return ast.StDisplay{Args: []ast.Expr{ex}}
+	var args []ast.Expr
+	for _, t := range tok[1:] {
+		t = strings.TrimSpace(t)
+		if t == "" {
+			continue
+		}
+		if ex := parseExpr(t); ex != nil {
+			args = append(args, ex)
+		}
+	}
+	if len(args) == 0 {
+		return nil
+	}
+	return ast.StDisplay{Args: args}
 }
 
 // ───────────────────────────────────────────────────────────────────────────────
@@ -864,6 +1119,41 @@ func parseExpr(tok string) ast.Expr {
 		}
 	}
 	return ast.Ident{Name: strings.ToUpper(tok)}
+}
+
+func parseValueLiteral(raw string) *ast.Literal {
+	r := strings.TrimSpace(raw)
+	if r == "" {
+		return nil
+	}
+	// 去掉尾端註解或逗號
+	r = strings.TrimSuffix(r, ",")
+	if (strings.HasPrefix(r, `"`) && strings.HasSuffix(r, `"`)) ||
+		(strings.HasPrefix(r, `'`) && strings.HasSuffix(r, `'`)) {
+		return &ast.Literal{Kind: "string", Str: trimQuotes(r)}
+	}
+	up := strings.ToUpper(r)
+	switch up {
+	case "SPACE", "SPACES":
+		return &ast.Literal{Kind: "string", Str: " "}
+	case "ZERO", "ZEROS", "ZEROES":
+		return &ast.Literal{Kind: "number", Str: "0"}
+	}
+	if strings.HasPrefix(up, "ALL ") {
+		rest := strings.TrimSpace(r[4:])
+		if lit := parseValueLiteral(rest); lit != nil {
+			return lit
+		}
+	}
+	// 處理正負號整數
+	trimmed := strings.TrimPrefix(strings.TrimPrefix(r, "+"), "-")
+	if isNumber(trimmed) {
+		return &ast.Literal{Kind: "number", Str: r}
+	}
+	if _, err := strconv.Atoi(r); err == nil {
+		return &ast.Literal{Kind: "number", Str: r}
+	}
+	return &ast.Literal{Kind: "string", Str: r}
 }
 
 func guessProgramID(lines []string) string {
